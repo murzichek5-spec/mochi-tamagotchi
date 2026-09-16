@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.py[cod]
+.cache/
+cache/rooms/*
+!cache/rooms/.gitkeep
+*.log
+.DS_Store
+mochi.db
+mochi.db-shm
+mochi.db-wal
