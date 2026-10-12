@@ -1,4 +1,6 @@
 import hashlib
+import json
+import random
 import re
 import secrets
 import sqlite3
@@ -8,7 +10,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from catalog import SHOP_ITEMS
+from catalog import DROP_ONLY_ITEMS, RARITY_INFO, SHOP_ITEMS
 
 DB_PATH = Path(__file__).resolve().with_name("mochi.db")
 DB_BUSY_TIMEOUT_MS = 5000
@@ -27,8 +29,37 @@ async def db_connection():
 
 # ---- Базовые конфиги игры ----
 DAILY_TASKS_PER_DAY = 4
+DAILY_COMPLETION_BONUS_COINS = 45
+DAILY_COMPLETION_BONUS_XP = 50
+RANDOM_EVENT_MIN_MINUTES = 240
+RANDOM_EVENT_MAX_MINUTES = 480
+MINIGAME_COOLDOWN_MINUTES = 20
+MINIGAME_SESSION_MINUTES = 5
+HOURLY_HUNGER_DECAY = 4
+HOURLY_HAPPINESS_DECAY = 2
+HOURLY_ENERGY_DECAY = 1
+JOINT_STREAK_ACTIONS = frozenset({'joint'})
+SHOP_ROTATION_COUNTS = {'common': 8, 'uncommon': 4, 'rare': 3}
+SHOP_EPIC_CHANCE = 0.55
+SHOP_LEGENDARY_CHANCE = 0.14
 
-# Большой пул ежедневок. Вчерашние ключи мы исключаем
+# Случайные события небольшие и в основном позитивные: они оживляют питомца,
+# но не должны наказывать человека за то, что он не был онлайн в конкретную минуту.
+RANDOM_EVENTS = [
+    {'key': 'coin_under_rug', 'text': '🪙 Mochi нашёл блестящую монетку под ковриком.', 'coins': 18, 'weight': 16},
+    {'key': 'sunbeam', 'text': '☀️ Mochi нашёл идеальное солнечное пятнышко и немного отдохнул.', 'happiness': 6, 'energy': 10, 'weight': 15},
+    {'key': 'secret_snack', 'text': '🍪 Mochi каким-то чудом нашёл маленький вкусный перекус.', 'hunger': 12, 'happiness': 3, 'weight': 14},
+    {'key': 'zoomies', 'text': '💨 У Mochi внезапно случились зумисы по всей комнате!', 'happiness': 10, 'energy': -5, 'hunger': -2, 'weight': 14},
+    {'key': 'soft_blanket', 'text': '🧸 Mochi уютно устроился и набрался сил.', 'energy': 15, 'love': 4, 'weight': 13},
+    {'key': 'thinking_of_you', 'text': '💗 Mochi вспомнил о хозяевах и довольно замурчал.', 'love': 8, 'happiness': 5, 'weight': 13},
+    {'key': 'lucky_find', 'text': '✨ Сегодня удачный день: Mochi нашёл небольшой клад!', 'coins': 30, 'happiness': 4, 'weight': 7},
+    {'key': 'window_birds', 'text': '🐦 За окном появились птицы. Mochi долго и очень серьёзно за ними наблюдал.', 'happiness': 8, 'weight': 8},
+    {'key': 'mystery_box', 'text': '🎁 Mochi нашёл старую коробку. Кажется, внутри что-то редкое!', 'drop_mode': 'drop_only', 'weight': 3},
+    {'key': 'sparkly_stash', 'text': '✨ Mochi заметил странный блеск в углу комнаты и раскопал тайник.', 'drop_mode': 'rare_plus', 'weight': 4},
+]
+
+# Большой пул ежедневок. Вчерашние ключи мы исключаем, поэтому день реально ощущается новым,
+# чтобы набор не повторялся изо дня в день.
 DAILY_POOL = [
     ('care3', 'Позаботьтесь о питомце 3 раза', 'any', 3, 18, 20),
     ('care4', 'Сделайте 4 любых действия', 'any', 4, 22, 24),
@@ -56,6 +87,8 @@ DAILY_POOL = [
     ('feed_play5', 'Активный день: 5 кормлений/игр', 'feed|play', 5, 34, 38),
     ('calm3', 'Ласка или сон — 3 спокойных действия', 'love|sleep', 3, 23, 26),
     ('active4', 'Игра или совместное действие — 4 раза', 'play|joint', 4, 35, 40),
+    ('minigame1', 'Сыграйте в мини-игру', 'minigame', 1, 14, 16),
+    ('minigame2', 'Сыграйте в мини-игры 2 раза', 'minigame', 2, 22, 26),
 ]
 
 ACHIEVEMENTS = {
@@ -105,10 +138,31 @@ ACHIEVEMENTS = {
     'dailies25': ('Стабильность', 'Закройте 25 ежедневных заданий', 110, 130),
     'dailies50': ('Ежедневный ритуал', 'Закройте 50 ежедневных заданий', 190, 220),
     'dailies100': ('Ни дня без Mochi', 'Закройте 100 ежедневных заданий', 350, 400),
+    'dailyclear1': ('Идеальный день', 'Закройте все ежедневные задания за один день', 30, 35),
+    'dailyclear7': ('Неделя по плану', 'Полностью закройте ежедневки 7 раз', 100, 120),
+    'dailyclear30': ('Железная дисциплина', 'Полностью закройте ежедневки 30 раз', 280, 330),
+
+    'streak3': ('Три дня вместе', 'Завершайте совместное действие 3 дня подряд', 25, 30),
+    'streak7': ('Неделя вдвоём', 'Завершайте совместное действие 7 дней подряд', 65, 80),
+    'streak14': ('Две недели вместе', 'Завершайте совместное действие 14 дней подряд', 120, 150),
+    'streak30': ('Месяц вдвоём', 'Завершайте совместное действие 30 дней подряд', 260, 320),
+    'streak60': ('Два месяца командой', 'Завершайте совместное действие 60 дней подряд', 450, 550),
+    'streak100': ('Сто дней вместе', 'Завершайте совместное действие 100 дней подряд', 800, 1000),
+
+    'events5': ('Любопытная жизнь', 'Переживите 5 случайных событий', 35, 40),
+    'events20': ('Всегда что-то происходит', 'Переживите 20 случайных событий', 90, 110),
+    'events50': ('Главный герой', 'Переживите 50 случайных событий', 180, 220),
+
+    'games10': ('Игровая разминка', 'Завершите 10 мини-игр', 35, 45),
+    'games50': ('Аркадный Mochi', 'Завершите 50 мини-игр', 100, 130),
+    'games100': ('Чемпион мини-игр', 'Завершите 100 мини-игр', 220, 280),
 
     'collector3': ('Первые покупки', 'Соберите 3 предмета комнаты', 25, 30),
     'collector7': ('Коллекционер', 'Соберите 7 предметов комнаты', 55, 65),
     'collector12': ('Почти весь каталог', 'Соберите 12 предметов комнаты', 100, 120),
+    'rare_item1': ('Редкая находка', 'Получите редкий предмет или лучше', 30, 35),
+    'epic_item1': ('Фиолетовый блеск', 'Получите эпический предмет или лучше', 60, 75),
+    'legendary_item1': ('Легенда комнаты', 'Получите легендарный предмет', 120, 150),
     'decorator4': ('Уют начинается', 'Заполните 4 слота комнаты', 35, 45),
     'decorator8': ('Дом мечты', 'Заполните все 8 слотов комнаты', 100, 130),
 
@@ -131,6 +185,70 @@ def now_iso():
 def today_key():
     return now_utc().date().isoformat()
 
+
+def _next_random_event_at(base=None):
+    base = base or now_utc()
+    span = max(1, RANDOM_EVENT_MAX_MINUTES - RANDOM_EVENT_MIN_MINUTES + 1)
+    minutes = RANDOM_EVENT_MIN_MINUTES + secrets.randbelow(span)
+    return (base + timedelta(minutes=minutes)).isoformat()
+
+
+def _choose_random_event():
+    total = sum(max(1, int(event.get('weight', 1))) for event in RANDOM_EVENTS)
+    pick = secrets.randbelow(total)
+    for event in RANDOM_EVENTS:
+        weight = max(1, int(event.get('weight', 1)))
+        if pick < weight:
+            return event
+        pick -= weight
+    return RANDOM_EVENTS[-1]
+
+
+def _stage_key_for_level(level: int | None) -> str:
+    level = max(1, int(level or 1))
+    if level >= 20:
+        return 'adult'
+    if level >= 12:
+        return 'teen'
+    if level >= 5:
+        return 'kitten'
+    return 'baby'
+
+
+def _stage_title(stage_key: str) -> str:
+    return {'baby': 'Малыш', 'kitten': 'Котёнок', 'teen': 'Подросток', 'adult': 'Взрослый Mochi'}.get(stage_key, stage_key)
+
+
+def _history_item_text(item_key: str) -> str:
+    item = SHOP_ITEMS.get(item_key, {})
+    return f"{item.get('rarity_emoji', '⚪')} {item.get('emoji', '🎁')} {item.get('name', item_key)}"
+
+
+async def _add_history_in_tx(db, pet_id: int, kind: str, title: str, details: str = '', *, created_at: str | None = None, dedupe_key: str | None = None):
+    await db.execute(
+        'INSERT OR IGNORE INTO pet_history(pet_id,kind,title,details,created_at,dedupe_key) VALUES(?,?,?,?,?,?)',
+        (pet_id, kind, title, details, created_at or now_iso(), dedupe_key),
+    )
+
+
+def _shop_rotation_keys(pet_id: int, day: str) -> list[str]:
+    available = {
+        rarity: sorted(key for key, item in SHOP_ITEMS.items() if item.get('rarity') == rarity and key not in DROP_ONLY_ITEMS)
+        for rarity in RARITY_INFO
+    }
+    seed = int(hashlib.sha256(f'mochi-shop-v53:{pet_id}:{day}'.encode()).hexdigest()[:16], 16)
+    rng = random.Random(seed)
+    result: list[str] = []
+    for rarity, count in SHOP_ROTATION_COUNTS.items():
+        pool = available.get(rarity, [])
+        result.extend(rng.sample(pool, min(count, len(pool))))
+    epic = available.get('epic', [])
+    legendary = available.get('legendary', [])
+    if epic and rng.random() < SHOP_EPIC_CHANCE:
+        result.append(rng.choice(epic))
+    if legendary and rng.random() < SHOP_LEGENDARY_CHANCE:
+        result.append(rng.choice(legendary))
+    return result
 
 def parse_dt(value):
     if not value:
@@ -203,6 +321,18 @@ async def init_db():
             dailies_completed INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(pet_id) REFERENCES pets(id) ON DELETE CASCADE
         )''')
+        await _ensure_column(db, 'pet_metrics', 'current_streak', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'best_streak', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'last_checkin_day', 'TEXT')
+        await _ensure_column(db, 'pet_metrics', 'total_checkins', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'daily_full_clears', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'random_events_total', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'next_random_event_at', 'TEXT')
+        await _ensure_column(db, 'pet_metrics', 'minigames_total', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'joint_streak_current', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'joint_streak_best', 'INTEGER NOT NULL DEFAULT 0')
+        await _ensure_column(db, 'pet_metrics', 'last_joint_streak_day', 'TEXT')
+        await _ensure_column(db, 'pet_metrics', 'joint_streak_days_total', 'INTEGER NOT NULL DEFAULT 0')
         await db.execute('''CREATE TABLE IF NOT EXISTS daily_tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             pet_id INTEGER NOT NULL,
@@ -216,6 +346,54 @@ async def init_db():
             reward_xp INTEGER NOT NULL,
             completed INTEGER NOT NULL DEFAULT 0,
             UNIQUE(pet_id, day, task_key),
+            FOREIGN KEY(pet_id) REFERENCES pets(id) ON DELETE CASCADE
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS daily_bonus_claims (
+            pet_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            reward_coins INTEGER NOT NULL,
+            reward_xp INTEGER NOT NULL,
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY(pet_id, day),
+            FOREIGN KEY(pet_id) REFERENCES pets(id) ON DELETE CASCADE
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS random_event_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pet_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            happened_at TEXT NOT NULL,
+            coins_delta INTEGER NOT NULL DEFAULT 0,
+            hunger_delta INTEGER NOT NULL DEFAULT 0,
+            happiness_delta INTEGER NOT NULL DEFAULT 0,
+            energy_delta INTEGER NOT NULL DEFAULT 0,
+            love_delta INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(pet_id) REFERENCES pets(id) ON DELETE CASCADE
+        )''')
+        await _ensure_column(db, 'random_event_log', 'item_key', 'TEXT')
+        await db.execute('''CREATE TABLE IF NOT EXISTS pet_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pet_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            dedupe_key TEXT,
+            FOREIGN KEY(pet_id) REFERENCES pets(id) ON DELETE CASCADE,
+            UNIQUE(pet_id, dedupe_key)
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS minigame_sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            game_key TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0,1)),
+            completed_at TEXT,
+            result TEXT,
+            reward_coins INTEGER NOT NULL DEFAULT 0,
+            reward_xp INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(pet_id) REFERENCES pets(id) ON DELETE CASCADE
         )''')
         await db.execute('''CREATE TABLE IF NOT EXISTS achievements (
@@ -287,11 +465,15 @@ async def init_db():
         await db.execute('CREATE INDEX IF NOT EXISTS idx_couples_u2 ON couples(user2_id)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_pets_couple ON pets(couple_id)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_daily_pet_day ON daily_tasks(pet_id, day)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_daily_bonus_day ON daily_bonus_claims(day, pet_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_random_event_pet_time ON random_event_log(pet_id, happened_at)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_history_pet_time ON pet_history(pet_id, created_at DESC, id DESC)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_minigame_user_pet_time ON minigame_sessions(user_id, pet_id, completed_at)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_joint_pet_status ON joint_actions(pet_id, status)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_ephemeral_user ON ephemeral_messages(user_id, created_at)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_promo_enabled ON promo_codes(enabled, created_at)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_promo_redemptions_user ON promo_redemptions(user_id, redeemed_at)')
-
+        # Счётчик — кэш для быстрого лимита, журнал активаций — источник истины.
         await db.execute('''UPDATE promo_codes
             SET used_count=(SELECT COUNT(*) FROM promo_redemptions r WHERE r.code=promo_codes.code)''')
 
@@ -302,13 +484,39 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO inventory(pet_id,item_key,quantity) SELECT pet_id,item_key,1 FROM room_equipment")
         # Активная связь должна принадлежать пользователю; битые ссылки сбрасываем.
         await db.execute("UPDATE users SET active_couple_id=NULL WHERE active_couple_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM couples c WHERE c.id=users.active_couple_id AND (c.user1_id=users.id OR c.user2_id=users.id))")
-
+        # Старые сборки могли оставить несколько pending-экшенов на одного питомца.
+        # Перед уникальным partial-index оставляем только самый свежий, остальные протухают.
         await db.execute("""UPDATE joint_actions SET status='expired'
             WHERE status='pending' AND id NOT IN (
                 SELECT MAX(id) FROM joint_actions WHERE status='pending' GROUP BY pet_id
             )""")
         await db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_joint_pending_pet
             ON joint_actions(pet_id) WHERE status='pending'""")
+
+        # История начинается с рождения. Для старых баз восстанавливаем также уже полученные достижения.
+        cur = await db.execute('SELECT id,name,created_at FROM pets')
+        for pet_row in await cur.fetchall():
+            await _add_history_in_tx(
+                db, int(pet_row[0]), 'birth', '🐣 Mochi появился',
+                f'{pet_row[1]} начал свою историю.', created_at=pet_row[2], dedupe_key='birth',
+            )
+        cur = await db.execute('SELECT pet_id,achievement_key,unlocked_at FROM achievements')
+        for ach_row in await cur.fetchall():
+            meta = ACHIEVEMENTS.get(ach_row[1])
+            if meta:
+                await _add_history_in_tx(
+                    db, int(ach_row[0]), 'achievement', '🏆 Получено достижение', meta[0],
+                    created_at=ach_row[2], dedupe_key=f'achievement:{ach_row[1]}',
+                )
+
+        # Старым питомцам назначаем первый момент случайного события только при миграции.
+        # Это предотвращает лавину событий сразу после первого запуска новой версии.
+        cur = await db.execute('SELECT pet_id FROM pet_metrics WHERE next_random_event_at IS NULL')
+        for row in await cur.fetchall():
+            await db.execute(
+                'UPDATE pet_metrics SET next_random_event_at=? WHERE pet_id=?',
+                (_next_random_event_at(), row[0]),
+            )
         await db.commit()
 
 
@@ -669,7 +877,8 @@ async def set_active_couple(user_id, couple_id):
 async def create_couple(user_id):
     now = now_iso()
     async with db_connection() as db:
-
+        # token_urlsafe(8) почти наверняка уникален, но UNIQUE должен иметь корректный retry,
+        # а не случайный IntegrityError в проде.
         cid = None
         for _ in range(5):
             code = secrets.token_urlsafe(8)
@@ -693,6 +902,11 @@ async def create_couple(user_id):
         )
         pid = pcur.lastrowid
         await db.execute('INSERT OR IGNORE INTO pet_metrics(pet_id) VALUES(?)', (pid,))
+        await _add_history_in_tx(db, pid, 'birth', '🐣 Mochi появился', 'Mochi начал свою историю.', created_at=now, dedupe_key='birth')
+        await db.execute(
+            'UPDATE pet_metrics SET next_random_event_at=COALESCE(next_random_event_at, ?) WHERE pet_id=?',
+            (_next_random_event_at(), pid),
+        )
         await db.execute('UPDATE users SET active_couple_id=? WHERE id=?', (cid, user_id))
         await db.commit()
     return await get_couple_by_id(cid)
@@ -776,7 +990,14 @@ async def rename_pet(pet_id, name):
     if not name:
         return False
     async with db_connection() as db:
+        cur = await db.execute('SELECT name FROM pets WHERE id=?', (pet_id,))
+        row = await cur.fetchone()
+        if not row:
+            return False
+        old_name = str(row[0] or 'Mochi')
         cur = await db.execute('UPDATE pets SET name=? WHERE id=?', (name, pet_id))
+        if cur.rowcount == 1 and old_name != name:
+            await _add_history_in_tx(db, pet_id, 'rename', '✏️ Новое имя', f'{old_name} → {name}')
         await db.commit()
     return cur.rowcount == 1
 
@@ -819,16 +1040,21 @@ async def apply_pet_decay(pet_id):
             return None
         last = parse_dt(pet['last_decay_at']) or parse_dt(pet['created_at']) or now_utc()
         now = now_utc()
-
+        # Будущая метка (битые часы/ручное редактирование БД) раньше замораживала
+        # деградацию на часы или дни. Нормализуем её к текущему времени.
         if last > now:
             last = now
             await db.execute('UPDATE pets SET last_decay_at=? WHERE id=?', (now.isoformat(), pet_id))
         hours = int((now - last).total_seconds() // 3600)
         if hours > 0:
-            hunger = max(0, pet['hunger'] - 3 * hours)
-            happiness = max(0, pet['happiness'] - hours)
+            hunger = max(0, pet['hunger'] - HOURLY_HUNGER_DECAY * hours)
+            happiness = max(0, pet['happiness'] - HOURLY_HAPPINESS_DECAY * hours)
+            energy = max(0, pet['energy'] - HOURLY_ENERGY_DECAY * hours)
             new_ts = datetime.fromtimestamp(last.timestamp() + hours * 3600, tz=timezone.utc).isoformat()
-            await db.execute('UPDATE pets SET hunger=?, happiness=?, last_decay_at=? WHERE id=?', (hunger, happiness, new_ts, pet_id))
+            await db.execute(
+                'UPDATE pets SET hunger=?, happiness=?, energy=?, last_decay_at=? WHERE id=?',
+                (hunger, happiness, energy, new_ts, pet_id),
+            )
         await db.commit()
     return await get_pet_by_id(pet_id)
 
@@ -855,6 +1081,42 @@ async def update_pet(pet_id, hunger_delta=0, happiness_delta=0, energy_delta=0, 
     return await get_pet_by_id(pet_id)
 
 
+async def apply_care_action(
+    pet_id, *, cost=0, hunger_delta=0, happiness_delta=0, energy_delta=0, love_delta=0
+):
+    """Atomically charge an action and apply its stat changes.
+
+    Returns ``(pet, reason)`` where reason is None on success, ``no_pet`` or
+    ``insufficient_coins`` on failure. Decay is applied before the transaction
+    so the action always works from current stats.
+    """
+    cost = max(0, int(cost or 0))
+    await apply_pet_decay(pet_id)
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute('BEGIN IMMEDIATE')
+        cur = await db.execute('SELECT * FROM pets WHERE id=?', (pet_id,))
+        p = await cur.fetchone()
+        if not p:
+            await db.rollback()
+            return None, 'no_pet'
+        if int(p['coins'] or 0) < cost:
+            await db.rollback()
+            return None, 'insufficient_coins'
+
+        hunger = max(0, min(100, int(p['hunger']) + int(hunger_delta)))
+        happiness = max(0, min(100, int(p['happiness']) + int(happiness_delta)))
+        energy = max(0, min(100, int(p['energy']) + int(energy_delta)))
+        love = max(0, min(100, int(p['love']) + int(love_delta)))
+        coins = int(p['coins'] or 0) - cost
+        await db.execute(
+            'UPDATE pets SET hunger=?,happiness=?,energy=?,love=?,coins=? WHERE id=?',
+            (hunger, happiness, energy, love, coins, pet_id),
+        )
+        await db.commit()
+    return await get_pet_by_id(pet_id), None
+
+
 async def _apply_progress_in_tx(db, pet_id, xp=0, coins=0):
     """Update XP/level/coins inside an already-open transaction."""
     cur = await db.execute('SELECT xp, level, coins FROM pets WHERE id=?', (pet_id,))
@@ -863,6 +1125,7 @@ async def _apply_progress_in_tx(db, pet_id, xp=0, coins=0):
         return None, 0
 
     level = max(1, int(p['level'] or 1))
+    old_stage = _stage_key_for_level(level)
     new_xp = max(0, int(p['xp'] or 0) + int(xp))
     new_coins = max(0, int(p['coins'] or 0) + int(coins))
     gained = 0
@@ -875,6 +1138,12 @@ async def _apply_progress_in_tx(db, pet_id, xp=0, coins=0):
         'UPDATE pets SET xp=?, level=?, coins=? WHERE id=?',
         (new_xp, level, new_coins, pet_id),
     )
+    new_stage = _stage_key_for_level(level)
+    if new_stage != old_stage:
+        await _add_history_in_tx(
+            db, pet_id, 'growth', '🌱 Mochi вырос',
+            f'Новый этап: {_stage_title(new_stage)}.', dedupe_key=f'stage:{new_stage}',
+        )
     return (new_xp, level, new_coins), gained
 
 
@@ -907,6 +1176,48 @@ async def spend_coins(pet_id, amount):
         return True
 
 
+async def _register_joint_streak_in_tx(db, pet_id: int, action_key: str):
+    """Advance the shared streak only after a completed joint action, at most once per UTC day."""
+    if action_key not in JOINT_STREAK_ACTIONS:
+        return None
+
+    day = today_key()
+    yesterday = (now_utc().date() - timedelta(days=1)).isoformat()
+    cur = await db.execute(
+        'SELECT joint_streak_current, joint_streak_best, last_joint_streak_day, joint_streak_days_total '
+        'FROM pet_metrics WHERE pet_id=?',
+        (pet_id,),
+    )
+    metrics = await cur.fetchone()
+    if not metrics:
+        return None
+
+    if metrics['last_joint_streak_day'] == day:
+        return {
+            'new_day': False,
+            'streak': int(metrics['joint_streak_current'] or 0),
+            'best_streak': int(metrics['joint_streak_best'] or 0),
+            'joint_streak_days_total': int(metrics['joint_streak_days_total'] or 0),
+        }
+
+    previous = int(metrics['joint_streak_current'] or 0)
+    streak = previous + 1 if metrics['last_joint_streak_day'] == yesterday else 1
+    best = max(int(metrics['joint_streak_best'] or 0), streak)
+    total_days = int(metrics['joint_streak_days_total'] or 0) + 1
+    await db.execute(
+        '''UPDATE pet_metrics
+           SET joint_streak_current=?, joint_streak_best=?, last_joint_streak_day=?, joint_streak_days_total=?
+           WHERE pet_id=?''',
+        (streak, best, day, total_days, pet_id),
+    )
+    return {
+        'new_day': True,
+        'streak': streak,
+        'best_streak': best,
+        'joint_streak_days_total': total_days,
+    }
+
+
 async def record_action(pet_id, action_key):
     # Ежедневки должны существовать до начала транзакции действия.
     await ensure_daily_tasks(pet_id)
@@ -929,9 +1240,10 @@ async def record_action(pet_id, action_key):
                 'UPDATE pet_metrics SET actions_total=actions_total+1 WHERE pet_id=?',
                 (pet_id,),
             )
+        joint_streak = await _register_joint_streak_in_tx(db, pet_id, action_key)
         completed = await _progress_daily_tasks_in_tx(db, pet_id, action_key, today_key())
         await db.commit()
-    return completed
+    return completed, joint_streak
 
 
 async def ensure_daily_tasks(pet_id):
@@ -1013,7 +1325,8 @@ async def _progress_daily_tasks_in_tx(db, pet_id, action_key, day):
                 'UPDATE pet_metrics SET dailies_completed=dailies_completed+1 WHERE pet_id=?',
                 (pet_id,),
             )
-
+            # Coins + XP начисляются в той же транзакции, поэтому рестарт между
+            # completed=1 и reward больше не может съесть часть награды.
             await _apply_progress_in_tx(
                 db,
                 pet_id,
@@ -1022,6 +1335,176 @@ async def _progress_daily_tasks_in_tx(db, pet_id, action_key, day):
             )
     return completed_now
 
+
+async def claim_daily_completion_bonus(pet_id):
+    """Grant the once-per-day bonus for completing every generated daily quest."""
+    await ensure_daily_tasks(pet_id)
+    day = today_key()
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute('BEGIN IMMEDIATE')
+        cur = await db.execute(
+            'SELECT COUNT(*) AS total, SUM(completed) AS done FROM daily_tasks WHERE pet_id=? AND day=?',
+            (pet_id, day),
+        )
+        counts = await cur.fetchone()
+        total = int(counts['total'] or 0)
+        done = int(counts['done'] or 0)
+        if total < DAILY_TASKS_PER_DAY or done < total:
+            await db.rollback()
+            return None
+
+        cur = await db.execute(
+            '''INSERT OR IGNORE INTO daily_bonus_claims(pet_id,day,reward_coins,reward_xp,claimed_at)
+               VALUES(?,?,?,?,?)''',
+            (pet_id, day, DAILY_COMPLETION_BONUS_COINS, DAILY_COMPLETION_BONUS_XP, now_iso()),
+        )
+        if cur.rowcount != 1:
+            await db.rollback()
+            return None
+
+        await db.execute('INSERT OR IGNORE INTO pet_metrics(pet_id) VALUES(?)', (pet_id,))
+        await db.execute(
+            'UPDATE pet_metrics SET daily_full_clears=daily_full_clears+1 WHERE pet_id=?',
+            (pet_id,),
+        )
+        await _apply_progress_in_tx(
+            db,
+            pet_id,
+            xp=DAILY_COMPLETION_BONUS_XP,
+            coins=DAILY_COMPLETION_BONUS_COINS,
+        )
+        await _add_history_in_tx(
+            db, pet_id, 'daily', '📅 Идеальный день',
+            f'Закрыты все {DAILY_TASKS_PER_DAY} ежедневных задания.', dedupe_key=f'dailyclear:{day}',
+        )
+        await db.commit()
+    return {
+        'coins': DAILY_COMPLETION_BONUS_COINS,
+        'xp': DAILY_COMPLETION_BONUS_XP,
+        'day': day,
+    }
+
+
+async def get_daily_overview(pet_id):
+    tasks = await ensure_daily_tasks(pet_id)
+    day = today_key()
+    yesterday = (now_utc().date() - timedelta(days=1)).isoformat()
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute('INSERT OR IGNORE INTO pet_metrics(pet_id) VALUES(?)', (pet_id,))
+        await db.commit()
+        cur = await db.execute('SELECT * FROM pet_metrics WHERE pet_id=?', (pet_id,))
+        metrics = await cur.fetchone()
+        cur = await db.execute('SELECT 1 FROM daily_bonus_claims WHERE pet_id=? AND day=?', (pet_id, day))
+        bonus_claimed = bool(await cur.fetchone())
+    visible_streak = int(metrics['joint_streak_current'] or 0)
+    if metrics['last_joint_streak_day'] not in {day, yesterday}:
+        visible_streak = 0
+    return {
+        'tasks': tasks,
+        'completed': sum(1 for t in tasks if t['completed']),
+        'total': len(tasks),
+        'bonus_claimed': bonus_claimed,
+        'bonus_coins': DAILY_COMPLETION_BONUS_COINS,
+        'bonus_xp': DAILY_COMPLETION_BONUS_XP,
+        'streak': visible_streak,
+        'best_streak': int(metrics['joint_streak_best'] or 0),
+        'joint_streak_days_total': int(metrics['joint_streak_days_total'] or 0),
+        'daily_full_clears': int(metrics['daily_full_clears'] or 0),
+    }
+
+
+async def get_due_random_event_pet_ids(limit=50):
+    now = now_utc()
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            '''SELECT pm.pet_id, pm.next_random_event_at
+               FROM pet_metrics pm
+               JOIN pets p ON p.id=pm.pet_id
+               JOIN couples c ON c.id=p.couple_id
+               WHERE c.user2_id IS NOT NULL
+               ORDER BY pm.pet_id'''
+        )
+        rows = await cur.fetchall()
+    due = []
+    for row in rows:
+        scheduled = parse_dt(row['next_random_event_at'])
+        if scheduled is not None and scheduled <= now:
+            due.append(int(row['pet_id']))
+            if len(due) >= max(1, int(limit)):
+                break
+    return due
+
+
+async def trigger_random_event(pet_id):
+    """Apply one due random event atomically, optionally drop an item, and schedule the next one."""
+    now = now_utc()
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute('BEGIN IMMEDIATE')
+        await db.execute('INSERT OR IGNORE INTO pet_metrics(pet_id) VALUES(?)', (pet_id,))
+        cur = await db.execute('SELECT next_random_event_at FROM pet_metrics WHERE pet_id=?', (pet_id,))
+        metrics = await cur.fetchone()
+        scheduled = parse_dt(metrics['next_random_event_at']) if metrics else None
+        if scheduled is None:
+            await db.execute('UPDATE pet_metrics SET next_random_event_at=? WHERE pet_id=?', (_next_random_event_at(now), pet_id))
+            await db.commit()
+            return None
+        if scheduled > now:
+            await db.rollback()
+            return None
+
+        cur = await db.execute('SELECT * FROM pets WHERE id=?', (pet_id,))
+        pet = await cur.fetchone()
+        if not pet:
+            await db.rollback()
+            return None
+
+        event = _choose_random_event()
+        target_hunger = max(0, min(100, int(pet['hunger']) + int(event.get('hunger', 0))))
+        target_happiness = max(0, min(100, int(pet['happiness']) + int(event.get('happiness', 0))))
+        target_energy = max(0, min(100, int(pet['energy']) + int(event.get('energy', 0))))
+        target_love = max(0, min(100, int(pet['love']) + int(event.get('love', 0))))
+        actual = {
+            'hunger': target_hunger - int(pet['hunger']),
+            'happiness': target_happiness - int(pet['happiness']),
+            'energy': target_energy - int(pet['energy']),
+            'love': target_love - int(pet['love']),
+            'coins': max(0, int(event.get('coins', 0))),
+        }
+
+        dropped_item = None
+        drop_mode = event.get('drop_mode')
+        if drop_mode:
+            cur = await db.execute('SELECT item_key FROM inventory WHERE pet_id=? AND quantity>0', (pet_id,))
+            owned = {row['item_key'] for row in await cur.fetchall()}
+            if drop_mode == 'drop_only':
+                candidates = [key for key in sorted(DROP_ONLY_ITEMS) if key in SHOP_ITEMS and key not in owned]
+            else:
+                candidates = [key for key, item in SHOP_ITEMS.items() if int(item.get('rarity_rank', 0)) >= 2 and key not in owned]
+            if candidates:
+                dropped_item = secrets.choice(candidates)
+                await db.execute('INSERT INTO inventory(pet_id,item_key,quantity) VALUES(?,?,1) ON CONFLICT(pet_id,item_key) DO UPDATE SET quantity=MAX(1, quantity)', (pet_id, dropped_item))
+                await _add_history_in_tx(db, pet_id, 'drop', '🎁 Редкая находка', _history_item_text(dropped_item), dedupe_key=f'item:{dropped_item}')
+            else:
+                actual['coins'] += 40
+
+        await db.execute('UPDATE pets SET hunger=?,happiness=?,energy=?,love=?,coins=coins+? WHERE id=?', (target_hunger, target_happiness, target_energy, target_love, actual['coins'], pet_id))
+        next_at = _next_random_event_at(now)
+        await db.execute('UPDATE pet_metrics SET random_events_total=random_events_total+1, next_random_event_at=? WHERE pet_id=?', (next_at, pet_id))
+        await db.execute('INSERT INTO random_event_log(pet_id,event_key,happened_at,coins_delta,hunger_delta,happiness_delta,energy_delta,love_delta,item_key) VALUES(?,?,?,?,?,?,?,?,?)', (pet_id, event['key'], now.isoformat(), actual['coins'], actual['hunger'], actual['happiness'], actual['energy'], actual['love'], dropped_item))
+        await db.commit()
+
+    return {
+        'pet_id': pet_id,
+        'key': event['key'],
+        'text': event['text'],
+        'effects': actual,
+        'item_key': dropped_item,
+        'next_event_at': next_at,
+    }
 
 async def progress_daily_tasks(pet_id, action_key):
     await ensure_daily_tasks(pet_id)
@@ -1037,6 +1520,202 @@ async def progress_daily_tasks(pet_id, action_key):
 
 async def get_daily_tasks(pet_id):
     return await ensure_daily_tasks(pet_id)
+
+
+async def get_minigame_cooldown(user_id: int, pet_id: int):
+    '''Return remaining cooldown seconds for rewarded mini-games.'''
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            '''SELECT completed_at FROM minigame_sessions
+               WHERE user_id=? AND pet_id=? AND completed=1 AND completed_at IS NOT NULL
+               ORDER BY completed_at DESC LIMIT 1''',
+            (int(user_id), int(pet_id)),
+        )
+        row = await cur.fetchone()
+    if not row:
+        return 0
+    completed_at = parse_dt(row['completed_at'])
+    if not completed_at:
+        return 0
+    ready_at = completed_at + timedelta(minutes=MINIGAME_COOLDOWN_MINUTES)
+    return max(0, int((ready_at - now_utc()).total_seconds()))
+
+
+async def create_minigame_session(user_id: int, pet_id: int, game_key: str):
+    '''Create one short-lived mini-game session after checking the reward cooldown.'''
+    game_key = str(game_key or '').strip().lower()
+    if game_key not in {'boxes', 'rps', 'higher'}:
+        return False, {'reason': 'unknown_game'}
+
+    cooldown = await get_minigame_cooldown(user_id, pet_id)
+    if cooldown > 0:
+        return False, {'reason': 'cooldown', 'seconds': cooldown}
+
+    if game_key == 'boxes':
+        payload = {'target': 1 + secrets.randbelow(3)}
+    elif game_key == 'rps':
+        payload = {'bot': ('rock', 'paper', 'scissors')[secrets.randbelow(3)]}
+    else:
+        current = 2 + secrets.randbelow(7)
+        nxt = 1 + secrets.randbelow(9)
+        payload = {'current': current, 'next': nxt}
+
+    token = secrets.token_urlsafe(6)
+    created = now_utc()
+    expires = created + timedelta(minutes=MINIGAME_SESSION_MINUTES)
+    async with db_connection() as db:
+        await db.execute('BEGIN IMMEDIATE')
+        await db.execute(
+            '''UPDATE minigame_sessions SET result='expired'
+               WHERE user_id=? AND pet_id=? AND completed=0 AND expires_at<?''',
+            (int(user_id), int(pet_id), created.isoformat()),
+        )
+        await db.execute(
+            '''INSERT INTO minigame_sessions(token,user_id,pet_id,game_key,payload,created_at,expires_at)
+               VALUES(?,?,?,?,?,?,?)''',
+            (token, int(user_id), int(pet_id), game_key, json.dumps(payload), created.isoformat(), expires.isoformat()),
+        )
+        await db.commit()
+    return True, {'token': token, 'game_key': game_key, 'payload': payload, 'expires_at': expires.isoformat()}
+
+
+def _resolve_minigame_outcome(game_key: str, payload: dict, answer: str):
+    answer = str(answer or '').strip().lower()
+    if game_key == 'boxes':
+        try:
+            picked = int(answer)
+        except ValueError:
+            return None
+        if picked not in {1, 2, 3}:
+            return None
+        won = picked == int(payload['target'])
+        return {
+            'result': 'win' if won else 'loss',
+            'coins': 24 if won else 3,
+            'xp': 12 if won else 3,
+            'happiness': 4 if won else 1,
+            'details': {'picked': picked, 'target': int(payload['target'])},
+        }
+
+    if game_key == 'rps':
+        if answer not in {'rock', 'paper', 'scissors'}:
+            return None
+        bot = str(payload['bot'])
+        wins = {('rock', 'scissors'), ('paper', 'rock'), ('scissors', 'paper')}
+        if answer == bot:
+            result, coins, xp, happiness = 'draw', 7, 5, 2
+        elif (answer, bot) in wins:
+            result, coins, xp, happiness = 'win', 18, 10, 4
+        else:
+            result, coins, xp, happiness = 'loss', 3, 3, 1
+        return {
+            'result': result, 'coins': coins, 'xp': xp, 'happiness': happiness,
+            'details': {'player': answer, 'bot': bot},
+        }
+
+    if game_key == 'higher':
+        if answer not in {'higher', 'lower'}:
+            return None
+        current = int(payload['current'])
+        nxt = int(payload['next'])
+        if nxt == current:
+            return {
+                'result': 'draw', 'coins': 6, 'xp': 4, 'happiness': 2,
+                'details': {'current': current, 'next': nxt, 'answer': answer},
+            }
+        correct = 'higher' if nxt > current else 'lower'
+        won = answer == correct
+        return {
+            'result': 'win' if won else 'loss',
+            'coins': 16 if won else 3,
+            'xp': 9 if won else 3,
+            'happiness': 3 if won else 1,
+            'details': {'current': current, 'next': nxt, 'answer': answer, 'correct': correct},
+        }
+    return None
+
+
+async def resolve_minigame_session(user_id: int, token: str, answer: str):
+    '''Resolve exactly once and grant rewards atomically. Cooldown starts on completion.'''
+    token = str(token or '').strip()
+    if not token:
+        return False, {'reason': 'invalid'}
+
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute('BEGIN IMMEDIATE')
+        cur = await db.execute('SELECT * FROM minigame_sessions WHERE token=?', (token,))
+        row = await cur.fetchone()
+        if not row or int(row['user_id']) != int(user_id):
+            await db.rollback()
+            return False, {'reason': 'not_found'}
+        if row['completed']:
+            await db.rollback()
+            return False, {'reason': 'already_done'}
+        expires = parse_dt(row['expires_at'])
+        now = now_utc()
+        if not expires or expires < now:
+            await db.execute("UPDATE minigame_sessions SET result='expired' WHERE token=?", (token,))
+            await db.commit()
+            return False, {'reason': 'expired'}
+
+        cur = await db.execute(
+            '''SELECT completed_at FROM minigame_sessions
+               WHERE user_id=? AND pet_id=? AND completed=1 AND completed_at IS NOT NULL
+               ORDER BY completed_at DESC LIMIT 1''',
+            (int(user_id), int(row['pet_id'])),
+        )
+        last = await cur.fetchone()
+        if last:
+            last_dt = parse_dt(last['completed_at'])
+            if last_dt:
+                remaining = int(((last_dt + timedelta(minutes=MINIGAME_COOLDOWN_MINUTES)) - now).total_seconds())
+                if remaining > 0:
+                    await db.rollback()
+                    return False, {'reason': 'cooldown', 'seconds': remaining}
+
+        try:
+            payload = json.loads(row['payload'])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            await db.rollback()
+            return False, {'reason': 'invalid'}
+        outcome = _resolve_minigame_outcome(row['game_key'], payload, answer)
+        if not outcome:
+            await db.rollback()
+            return False, {'reason': 'invalid_answer'}
+
+        pet_id = int(row['pet_id'])
+        await db.execute('INSERT OR IGNORE INTO pet_metrics(pet_id) VALUES(?)', (pet_id,))
+        await db.execute(
+            '''UPDATE pet_metrics SET actions_total=actions_total+1,
+               minigames_total=minigames_total+1 WHERE pet_id=?''',
+            (pet_id,),
+        )
+        cur = await db.execute('SELECT happiness,energy FROM pets WHERE id=?', (pet_id,))
+        pet = await cur.fetchone()
+        if not pet:
+            await db.rollback()
+            return False, {'reason': 'no_pet'}
+        happiness = max(0, min(100, int(pet['happiness']) + int(outcome['happiness'])))
+        energy = max(0, min(100, int(pet['energy']) - 2))
+        await db.execute('UPDATE pets SET happiness=?,energy=? WHERE id=?', (happiness, energy, pet_id))
+        await _apply_progress_in_tx(db, pet_id, xp=int(outcome['xp']), coins=int(outcome['coins']))
+        completed_tasks = await _progress_daily_tasks_in_tx(db, pet_id, 'minigame', today_key())
+        await db.execute(
+            '''UPDATE minigame_sessions SET completed=1,completed_at=?,result=?,reward_coins=?,reward_xp=?
+               WHERE token=? AND completed=0''',
+            (now.isoformat(), outcome['result'], int(outcome['coins']), int(outcome['xp']), token),
+        )
+        await db.commit()
+
+    return True, {
+        'reason': 'ok', 'pet_id': pet_id, 'game_key': row['game_key'],
+        'result': outcome['result'], 'coins': int(outcome['coins']), 'xp': int(outcome['xp']),
+        'happiness': int(outcome['happiness']), 'energy': -2,
+        'details': outcome['details'], 'completed_tasks': completed_tasks,
+        'cooldown_minutes': MINIGAME_COOLDOWN_MINUTES,
+    }
 
 
 async def get_metrics(pet_id):
@@ -1069,8 +1748,13 @@ async def check_achievements(pet_id):
                 await db.rollback()
                 return []
 
-            cur = await db.execute('SELECT COUNT(*) FROM inventory WHERE pet_id=? AND quantity>0', (pet_id,))
-            inventory_count = (await cur.fetchone())[0]
+            cur = await db.execute('SELECT item_key FROM inventory WHERE pet_id=? AND quantity>0', (pet_id,))
+            inventory_keys = [row['item_key'] for row in await cur.fetchall()]
+            inventory_count = len(inventory_keys)
+            rarity_ranks = [int(SHOP_ITEMS.get(key, {}).get('rarity_rank', 0)) for key in inventory_keys]
+            rare_count = sum(rank >= 2 for rank in rarity_ranks)
+            epic_count = sum(rank >= 3 for rank in rarity_ranks)
+            legendary_count = sum(rank >= 4 for rank in rarity_ranks)
             cur = await db.execute('SELECT COUNT(*) FROM room_equipment WHERE pet_id=?', (pet_id,))
             equipped_count = (await cur.fetchone())[0]
             created = parse_dt(p['created_at'])
@@ -1114,9 +1798,27 @@ async def check_achievements(pet_id):
                 'dailies25': m['dailies_completed'] >= 25,
                 'dailies50': m['dailies_completed'] >= 50,
                 'dailies100': m['dailies_completed'] >= 100,
+                'dailyclear1': m['daily_full_clears'] >= 1,
+                'dailyclear7': m['daily_full_clears'] >= 7,
+                'dailyclear30': m['daily_full_clears'] >= 30,
+                'streak3': m['joint_streak_best'] >= 3,
+                'streak7': m['joint_streak_best'] >= 7,
+                'streak14': m['joint_streak_best'] >= 14,
+                'streak30': m['joint_streak_best'] >= 30,
+                'streak60': m['joint_streak_best'] >= 60,
+                'streak100': m['joint_streak_best'] >= 100,
+                'events5': m['random_events_total'] >= 5,
+                'events20': m['random_events_total'] >= 20,
+                'events50': m['random_events_total'] >= 50,
+                'games10': m['minigames_total'] >= 10,
+                'games50': m['minigames_total'] >= 50,
+                'games100': m['minigames_total'] >= 100,
                 'collector3': inventory_count >= 3,
                 'collector7': inventory_count >= 7,
                 'collector12': inventory_count >= 12,
+                'rare_item1': rare_count >= 1,
+                'epic_item1': epic_count >= 1,
+                'legendary_item1': legendary_count >= 1,
                 'decorator4': equipped_count >= 4,
                 'decorator8': equipped_count >= 8,
                 'love100': p['love'] >= 100,
@@ -1139,7 +1841,11 @@ async def check_achievements(pet_id):
                     continue
                 unlocked_now.append(key)
                 added_this_pass += 1
-                _, _, coins, xp = ACHIEVEMENTS[key]
+                title, _, coins, xp = ACHIEVEMENTS[key]
+                await _add_history_in_tx(
+                    db, pet_id, 'achievement', '🏆 Получено достижение', title,
+                    dedupe_key=f'achievement:{key}',
+                )
                 await _apply_progress_in_tx(db, pet_id, xp=xp, coins=coins)
 
             if added_this_pass == 0:
@@ -1152,10 +1858,90 @@ async def check_achievements(pet_id):
     return unlocked_now
 
 
+async def get_pet_profile(pet_id):
+    """Return a compact production-safe profile snapshot for one Mochi."""
+    day = today_key()
+    yesterday = (now_utc().date() - timedelta(days=1)).isoformat()
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute('INSERT OR IGNORE INTO pet_metrics(pet_id) VALUES(?)', (pet_id,))
+        await db.commit()
+
+        cur = await db.execute('SELECT * FROM pets WHERE id=?', (pet_id,))
+        pet = await cur.fetchone()
+        cur = await db.execute('SELECT * FROM pet_metrics WHERE pet_id=?', (pet_id,))
+        metrics = await cur.fetchone()
+        if not pet or not metrics:
+            return None
+
+        cur = await db.execute('SELECT item_key FROM inventory WHERE pet_id=? AND quantity>0', (pet_id,))
+        inventory_keys = [row['item_key'] for row in await cur.fetchall()]
+        rarity_counts = {'common': 0, 'uncommon': 0, 'rare': 0, 'epic': 0, 'legendary': 0}
+        rarity_totals = {key: 0 for key in rarity_counts}
+        for item in SHOP_ITEMS.values():
+            rarity = str(item.get('rarity', 'common'))
+            if rarity in rarity_totals:
+                rarity_totals[rarity] += 1
+        for key in inventory_keys:
+            rarity = str(SHOP_ITEMS.get(key, {}).get('rarity', 'common'))
+            if rarity in rarity_counts:
+                rarity_counts[rarity] += 1
+
+        cur = await db.execute('SELECT COUNT(*) AS c FROM achievements WHERE pet_id=?', (pet_id,))
+        achievements_count = int((await cur.fetchone())['c'])
+        cur = await db.execute('SELECT COUNT(*) AS c FROM room_equipment WHERE pet_id=?', (pet_id,))
+        equipped_count = int((await cur.fetchone())['c'])
+
+    created = parse_dt(pet['created_at'])
+    age_days = max(0, (now_utc() - created).days) if created else 0
+    joint_streak = int(metrics['joint_streak_current'] or 0)
+    if metrics['last_joint_streak_day'] not in {day, yesterday}:
+        joint_streak = 0
+
+    return {
+        'pet': dict(pet),
+        'age_days': age_days,
+        'metrics': dict(metrics),
+        'joint_streak': joint_streak,
+        'joint_streak_best': int(metrics['joint_streak_best'] or 0),
+        'joint_streak_days_total': int(metrics['joint_streak_days_total'] or 0),
+        'inventory_total': len(inventory_keys),
+        'catalog_total': len(SHOP_ITEMS),
+        'rarity_counts': rarity_counts,
+        'rarity_totals': rarity_totals,
+        'drop_only_owned': sum(1 for key in inventory_keys if key in DROP_ONLY_ITEMS),
+        'drop_only_total': len(DROP_ONLY_ITEMS),
+        'equipped_count': equipped_count,
+        'achievements_count': achievements_count,
+        'achievements_total': len(ACHIEVEMENTS),
+    }
+
+
 async def get_achievements(pet_id):
     async with db_connection() as db:
         cur = await db.execute('SELECT achievement_key FROM achievements WHERE pet_id=?', (pet_id,))
         return {r[0] for r in await cur.fetchall()}
+
+
+async def get_shop_rotation(pet_id: int, day: str | None = None):
+    day = day or today_key()
+    keys = _shop_rotation_keys(int(pet_id), day)
+    return {key: SHOP_ITEMS[key] for key in keys if key in SHOP_ITEMS}
+
+
+async def get_pet_history(pet_id: int, limit: int = 10, offset: int = 0):
+    limit = max(1, min(20, int(limit)))
+    offset = max(0, int(offset))
+    async with db_connection() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute('SELECT COUNT(*) AS c FROM pet_history WHERE pet_id=?', (pet_id,))
+        total = int((await cur.fetchone())['c'])
+        cur = await db.execute(
+            'SELECT id,kind,title,details,created_at FROM pet_history WHERE pet_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?',
+            (pet_id, limit, offset),
+        )
+        rows = [dict(row) for row in await cur.fetchall()]
+    return rows, total
 
 
 async def purchase_item(pet_id, item_key, price=None):
@@ -1163,7 +1949,10 @@ async def purchase_item(pet_id, item_key, price=None):
     item = SHOP_ITEMS.get(item_key)
     if not item:
         return False, 'unknown_item'
-
+    if item_key in DROP_ONLY_ITEMS or item_key not in _shop_rotation_keys(int(pet_id), today_key()):
+        return False, 'not_in_rotation'
+    # price остаётся необязательным аргументом только для совместимости со старыми вызовами.
+    # Источником истины всегда является каталог, поэтому подмена цены не влияет на списание.
     price = max(0, int(item['price']))
     async with db_connection() as db:
         db.row_factory = aiosqlite.Row
@@ -1184,6 +1973,10 @@ async def purchase_item(pet_id, item_key, price=None):
         await db.execute('UPDATE pets SET coins=coins-? WHERE id=?', (price, pet_id))
         await db.execute('''INSERT INTO inventory(pet_id,item_key,quantity) VALUES(?,?,1)
             ON CONFLICT(pet_id,item_key) DO UPDATE SET quantity=1''', (pet_id, item_key))
+        await _add_history_in_tx(
+            db, pet_id, 'purchase', '🛍 Новый предмет', _history_item_text(item_key),
+            dedupe_key=f'item:{item_key}',
+        )
         await db.commit()
         return True, 'ok'
 
@@ -1344,7 +2137,7 @@ async def apply_decay_to_all_pets():
     async with db_connection() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            'SELECT id,hunger,happiness,last_decay_at,created_at FROM pets ORDER BY id'
+            'SELECT id,hunger,happiness,energy,last_decay_at,created_at FROM pets ORDER BY id'
         )
         rows = await cur.fetchall()
 
@@ -1354,9 +2147,9 @@ async def apply_decay_to_all_pets():
         due = last is None or last > now or (now - last).total_seconds() >= 3600
         if not due:
             continue
-        before = (row['hunger'], row['happiness'])
+        before = (row['hunger'], row['happiness'], row['energy'])
         pet = await apply_pet_decay(row['id'])
-        if pet and (pet['hunger'], pet['happiness']) != before:
+        if pet and (pet['hunger'], pet['happiness'], pet['energy']) != before:
             changed.append(row['id'])
     return changed
 

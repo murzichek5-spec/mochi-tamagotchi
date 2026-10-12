@@ -5,6 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
+# Загружаем только .env этого проекта, а не случайный файл из текущей рабочей папки.
 load_dotenv(ROOT / '.env')
 
 BOT_TOKEN = (os.getenv('BOT_TOKEN') or '').strip()

@@ -15,13 +15,16 @@ from catalog import SHOP_ITEMS, SLOT_NAMES
 from db import (
     ACHIEVEMENTS,
     add_progress,
+    apply_care_action,
     apply_decay_to_all_pets,
     both_inactive_for_hours_for_couple,
     check_achievements,
+    claim_daily_completion_bonus,
     clear_screen,
     complete_joint_action,
     create_couple,
     create_joint_action,
+    create_minigame_session,
     create_promo_code,
     equip_item,
     get_achievements,
@@ -32,15 +35,20 @@ from db import (
     get_couple_id_by_pet,
     get_couple_user_ids_by_pet,
     get_couples_by_user,
-    get_daily_tasks,
+    get_daily_overview,
+    get_due_random_event_pet_ids,
     get_ephemeral_messages,
     get_inventory,
+    get_minigame_cooldown,
     get_partner_id,
     get_promo_codes,
     get_pet_by_couple,
     get_pet_by_id,
     get_pet_by_user,
+    get_pet_profile,
+    get_pet_history,
     get_room_equipment,
+    get_shop_rotation,
     get_screen,
     get_screen_state,
     get_user,
@@ -53,12 +61,14 @@ from db import (
     save_ephemeral_message,
     delete_ephemeral_message,
     rename_pet,
+    resolve_minigame_session,
     save_user,
     set_active_couple,
     set_promo_enabled,
     set_screen,
     set_screen_state,
     touch_user,
+    trigger_random_event,
     update_pet,
 )
 from room_renderer import GROWTH_STAGES, growth_stage, render_room_gif
@@ -69,10 +79,19 @@ from keyboards import (
     back_keyboard,
     bonds_keyboard,
     equip_keyboard,
+    feed_options_keyboard,
+    boxes_game_keyboard,
+    higher_game_keyboard,
+    history_keyboard,
+    love_options_keyboard,
     joint_finish_keyboard,
     main_keyboard,
+    minigames_keyboard,
     mochi_mail_keyboard,
+    profile_keyboard,
+    play_options_keyboard,
     room_keyboard,
+    rps_game_keyboard,
     shop_keyboard,
 )
 
@@ -87,7 +106,9 @@ SCREEN_EDIT_MIN_INTERVAL = 1.05
 GLOBAL_SCREEN_EDIT_MIN_INTERVAL = 0.85
 MOCHI_MAIL_COOLDOWN_SECONDS = 6
 DECAY_REFRESH_INTERVAL_SECONDS = 60
+RANDOM_EVENT_REFRESH_INTERVAL_SECONDS = 300
 BROADCAST_MAX_LENGTH = 4096
+# 15 msg/s leaves headroom below Telegram's usual bot-wide sending limit.
 BROADCAST_SEND_INTERVAL_SECONDS = 1 / 15
 BROADCAST_CONFIRM_TTL_SECONDS = 15 * 60
 BROADCAST_LOCK = asyncio.Lock()
@@ -106,7 +127,7 @@ PET_ACTION_LOCKS = {}
 ACTION_RESTORE_TASKS = {}
 SCREEN_ACTION_UNTIL = {}
 
-# Все побочные сообщения бота складываем сюды. Главный экран сюда НИКОГДА не пишем,
+# Все побочные сообщения бота складываем сюда. Главный экран сюда НИКОГДА не пишем,
 # иначе следующим кликом сами же удалим главный экран.
 EPHEMERAL_MESSAGES = {}
 
@@ -179,6 +200,10 @@ class CleanupEphemeralMiddleware(BaseMiddleware):
         user = getattr(event, 'from_user', None)
         if user:
             await cleanup_ephemeral(user.id)
+            try:
+                await touch_user(user.id)
+            except Exception as exc:
+                print(f'Activity touch error user={user.id}: {exc}')
         return await handler(event, data)
 
 
@@ -247,6 +272,7 @@ async def safe_callback_answer(callback, *args, **kwargs):
     try:
         await callback.answer(*args, **kwargs)
     except TelegramRetryAfter:
+        # Callback живёт недолго; ждать rate-limit здесь хуже, чем молча отпустить spinner.
         return
     except TelegramBadRequest as exc:
         text = str(exc).lower()
@@ -311,7 +337,7 @@ def next_growth_stage(level: int | None) -> dict | None:
 
 def item_label(item_key):
     item = SHOP_ITEMS.get(item_key)
-    return f'{item["emoji"]} {item["name"]}' if item else item_key
+    return f'{item.get("rarity_emoji", "⚪")} {item["emoji"]} {item["name"]}' if item else item_key
 
 
 async def room_short(pet_id):
@@ -325,6 +351,85 @@ async def room_short(pet_id):
     return ' '.join(bits) if bits else 'кастомная'
 
 
+def mochi_condition(pet, *, inactive: bool = False, has_partner: bool = True) -> dict:
+    """Return the current gameplay condition derived only from live stats.
+
+    Conditions are intentionally not persisted: a stale label can never survive a
+    stat change, restart or manual refresh. Priority goes from critical needs to
+    softer personality-like moods.
+    """
+    if not pet or not has_partner:
+        return {
+            'key': 'waiting', 'emoji': '👀', 'title': 'Ждёт второго хозяина',
+            'text': 'пока ждёт второго хозяина.', 'visual': 'idle',
+        }
+    if inactive:
+        return {
+            'key': 'lonely', 'emoji': '🥺', 'title': 'Скучает',
+            'text': 'скучает — вы оба давно не заходили.', 'visual': 'sad',
+        }
+
+    hunger = int(pet['hunger'])
+    happiness = int(pet['happiness'])
+    energy = int(pet['energy'])
+    love = int(pet['love'])
+
+    if min(hunger, happiness, energy) <= 10:
+        return {
+            'key': 'sick', 'emoji': '🤒', 'title': 'Плохо себя чувствует',
+            'text': 'плохо себя чувствует — ему срочно нужна забота.', 'visual': 'sick',
+        }
+    if hunger <= 22:
+        return {
+            'key': 'very_hungry', 'emoji': '🍽', 'title': 'Очень голодный',
+            'text': 'очень голоден и поглядывает в сторону миски.', 'visual': 'hungry',
+        }
+    if energy <= 20:
+        return {
+            'key': 'exhausted', 'emoji': '😴', 'title': 'Измотан',
+            'text': 'совсем вымотался и хочет отдохнуть.', 'visual': 'sleep',
+        }
+    if happiness <= 25:
+        return {
+            'key': 'sad', 'emoji': '🌧', 'title': 'Грустит',
+            'text': 'немного грустит и хочет внимания.', 'visual': 'sad',
+        }
+    if happiness >= 90 and energy >= 65 and hunger >= 45:
+        return {
+            'key': 'overexcited', 'emoji': '🤪', 'title': 'Перевозбуждён',
+            'text': 'переполнен энергией и готов носиться по комнате!', 'visual': 'happy',
+        }
+    if happiness >= 78 and hunger >= 55 and energy >= 40 and love >= 50:
+        return {
+            'key': 'happy', 'emoji': '🥰', 'title': 'Счастливый',
+            'text': 'счастлив и явно доволен жизнью.', 'visual': 'happy',
+        }
+    if energy <= 35:
+        return {
+            'key': 'sleepy', 'emoji': '🥱', 'title': 'Сонный',
+            'text': 'сонно моргает и подумывает о кроватке.', 'visual': 'sleep',
+        }
+    if hunger <= 42:
+        return {
+            'key': 'hungry', 'emoji': '🥣', 'title': 'Проголодался',
+            'text': 'уже немного проголодался.', 'visual': 'hungry',
+        }
+    if happiness <= 45:
+        return {
+            'key': 'capricious', 'emoji': '😼', 'title': 'Капризничает',
+            'text': 'слегка капризничает — настроение так себе.', 'visual': 'sad',
+        }
+    if love <= 30:
+        return {
+            'key': 'needs_love', 'emoji': '💕', 'title': 'Хочет ласки',
+            'text': 'явно хочет немного больше ласки.', 'visual': 'idle',
+        }
+    return {
+        'key': 'calm', 'emoji': '✨', 'title': 'Спокоен',
+        'text': 'чувствует себя спокойно и хорошо.', 'visual': 'idle',
+    }
+
+
 async def pet_caption(user_id, action_text=None):
     couple = await get_active_couple(user_id)
     pet = await get_pet_by_user(user_id)
@@ -335,30 +440,16 @@ async def pet_caption(user_id, action_text=None):
     partner = await partner_label(user_id, couple)
     pet_name = escape(str(pet['name']))
     partner_name = escape(str(partner))
+    condition = mochi_condition(pet, inactive=inactive, has_partner=bool(couple['user2_id']))
     if action_text:
         status = escape(str(action_text))
-    elif not couple['user2_id']:
-        status = '👀 Питомец пока ждёт второго хозяина.'
-    elif inactive:
-        status = f'🥺 {pet_name} скучает — вы оба давно не заходили.'
     else:
-        visual_state = pet_visual_state(pet, inactive=False, has_partner=True)
-        if visual_state == 'sick':
-            status = f'🤒 {pet_name} плохо себя чувствует — ему срочно нужна забота.'
-        elif visual_state == 'hungry':
-            status = f'🍽 {pet_name} очень голоден.'
-        elif visual_state == 'sleep':
-            status = f'😴 {pet_name} совсем вымотался и хочет отдохнуть.'
-        elif visual_state == 'sad':
-            status = f'🌧 {pet_name} немного грустит.'
-        elif visual_state == 'happy':
-            status = f'😸 {pet_name} в отличном настроении!'
-        else:
-            status = f'✨ {pet_name} чувствует себя хорошо.'
+        status = f'{condition["emoji"]} {pet_name} {condition["text"]}'
 
     bonds = await get_couples_by_user(user_id, include_pending=False)
     need_xp = 100 * pet['level']
     room = await room_short(pet['id'])
+    daily = await get_daily_overview(pet['id'])
     stage = current_growth_stage(pet['level'])
     upcoming = next_growth_stage(pet['level'])
     growth_line = f'🌱 Этап роста <b>{stage["title"]}</b>'
@@ -366,10 +457,12 @@ async def pet_caption(user_id, action_text=None):
         growth_line += f' · следующий на <b>{upcoming["min_level"]}</b> ур.'
     return (
         f'🐱 <b>{pet_name}</b> · вместе с <b>{partner_name}</b>\n'
-        f'{status}\n\n'
+        f'{status}\n'
+        f'💭 Состояние: <b>{condition["emoji"]} {condition["title"]}</b>\n\n'
         f'⭐ Уровень <b>{pet["level"]}</b> · XP <b>{pet["xp"]}/{need_xp}</b>\n'
         f'{growth_line}\n'
         f'🪙 Монеты <b>{pet["coins"]}</b> · 🏠 Комната: <b>{room}</b>\n\n'
+        f'🤝 Стрик вместе <b>{daily["streak"]}</b> дн. · 📅 Квесты <b>{daily["completed"]}/{daily["total"]}</b>\n\n'
         f'🍓 Сытость  <b>{pet["hunger"]}/100</b>\n{progress(pet["hunger"])}\n'
         f'✨ Настроение  <b>{pet["happiness"]}/100</b>\n{progress(pet["happiness"])}\n'
         f'⚡ Энергия  <b>{pet["energy"]}/100</b>\n{progress(pet["energy"])}\n'
@@ -378,22 +471,8 @@ async def pet_caption(user_id, action_text=None):
     )
 
 def pet_visual_state(pet, *, inactive: bool = False, has_partner: bool = True) -> str:
-    """Map existing pet stats to the full supplied animation set."""
-    if not pet or not has_partner:
-        return 'idle'
-    if inactive:
-        return 'sad'
-    if pet['hunger'] <= 10 or pet['happiness'] <= 10 or pet['energy'] <= 10:
-        return 'sick'
-    if pet['hunger'] <= 30:
-        return 'hungry'
-    if pet['energy'] <= 20:
-        return 'sleep'
-    if pet['happiness'] <= 30:
-        return 'sad'
-    if pet['happiness'] >= 75 and pet['hunger'] >= 60 and pet['energy'] >= 40 and pet['love'] >= 50:
-        return 'happy'
-    return 'idle'
+    """Map the richer gameplay condition to the supplied animation set."""
+    return mochi_condition(pet, inactive=inactive, has_partner=has_partner)['visual']
 
 
 async def screen_default_state(user_id: int, pet=None) -> str:
@@ -441,6 +520,8 @@ async def safe_edit_caption(user_id, chat_id, message_id, caption, reply_markup=
         if user_wait > 0:
             await asyncio.sleep(user_wait)
 
+        # Два хозяина раньше редактировались через gather одновременно, что провоцировало Flood Control.
+        # Теперь все изменения главных экранов проходят через одну очередь.
         async with GLOBAL_SCREEN_EDIT_LOCK:
             global_wait = GLOBAL_SCREEN_EDIT_MIN_INTERVAL - (loop.time() - GLOBAL_SCREEN_EDIT_LAST_AT)
             if global_wait > 0:
@@ -460,6 +541,7 @@ async def safe_edit_caption(user_id, chat_id, message_id, caption, reply_markup=
                 except TelegramRetryAfter as exc:
                     retry = float(getattr(exc, 'retry_after', 3))
                     SCREEN_BLOCKED_UNTIL[user_id] = loop.time() + retry + 0.5
+                    # Один раз честно ждём retry_after и повторяем. Ошибку не спамим наружу.
                     if attempt == 0 and retry <= 12:
                         await asyncio.sleep(retry + 0.5)
                         continue
@@ -524,7 +606,9 @@ async def refresh_screen_media(user_id, state=None, action_text=None):
                     SCREEN_LAST_CAPTION[user_id] = caption
                     SCREEN_LAST_STATE[user_id] = visual_state
                     return True
-
+                # Раньше ЛЮБАЯ ошибка editMessageMedia стирала screen_message_id.
+                # После этого кнопка «Обновить» считала экран отсутствующим и слала новый.
+                # Сбрасываем указатель только когда Telegram явно говорит, что сообщения нет.
                 if _message_is_gone(exc):
                     await clear_screen(user_id)
                     SCREEN_LAST_CAPTION.pop(user_id, None)
@@ -550,6 +634,7 @@ async def refresh_room_media_for_pet(pet_id):
 async def refresh_screen(user_id, action_text=None):
     screen = await get_screen(user_id)
     if not screen:
+        # Фоновое обновление и кнопка refresh не должны плодить новые экраны.
         # Новый экран создаётся только явными /start и /screen.
         return False
     chat_id, message_id = screen
@@ -579,11 +664,15 @@ async def sync_screen(user_id, action_text=None, *, force_media=False):
     screen = await get_screen(user_id)
     if not screen:
         return False
-    pet = await get_pet_by_user(user_id)  
+    pet = await get_pet_by_user(user_id)  # applies any due decay first
     if not pet:
         return False
     desired_state = await screen_default_state(user_id, pet)
     stored_state = await get_screen_state(user_id)
+
+    # Caption со статами обновляем независимо от media. Это ключевой fail-safe:
+    # даже если Telegram временно отвергнет editMessageMedia, цифры на экране
+    # всё равно останутся актуальными.
     caption_updated = await refresh_screen(user_id, action_text)
 
     if force_media or stored_state != desired_state:
@@ -676,6 +765,8 @@ async def show_action_on_screen(user_id: int, pet_id: int, state: str, action_te
     SCREEN_ACTION_UNTIL[user_id] = asyncio.get_running_loop().time() + ACTION_MESSAGE_SECONDS + 1.0
     edited = await refresh_screen_media(user_id, state=state, action_text=action_text)
     if not edited:
+        # Telegram may occasionally refuse an edit (old message/client edge case).
+        # Keep the action visible with a temporary animation, but never create a new main screen.
         SCREEN_ACTION_UNTIL.pop(user_id, None)
         return await send_temp_animation(
             user_id,
@@ -721,14 +812,22 @@ async def send_temp_text(
     return None
 
 
-async def answer_ephemeral(message: Message, text, *, reply_markup=None, parse_mode='HTML', delay=None):
+async def answer_ephemeral(
+    message: Message, text, *, reply_markup=None, parse_mode='HTML', delay=None,
+    cleanup_on_next=True,
+):
     # Универсальный answer, который мы потом подчистим следующим действием пользователя.
+    # Интерактивные мини-игры могут попросить оставить своё сообщение до нажатия кнопки.
     return await send_temp_text(
-        message.chat.id, text, delay=delay, reply_markup=reply_markup, parse_mode=parse_mode
+        message.chat.id, text, delay=delay, reply_markup=reply_markup, parse_mode=parse_mode,
+        cleanup_on_next=cleanup_on_next,
     )
 
 
 async def notify_action_to_couple(actor_id, couple_id, pet_id, state, action_text):
+    # Старый вариант слал ДВЕ анимации на каждое действие + потом удалял их.
+    # Это было главным генератором Flood Control. Главные экраны и так синхронизируются,
+    # поэтому партнёру оставляем лёгкое текстовое уведомление.
     actor = await get_user(actor_id)
     actor_name = actor['first_name'] if actor and actor['first_name'] else 'Партнёр'
     actor_name_html = escape(str(actor_name))
@@ -749,7 +848,9 @@ async def send_mochi_mail(
     couple_id: int | None = None,
     pet_id: int | None = None,
 ):
-
+    # Для быстрых фраз используем активного Mochi. Для FSM-сценария своего текста
+    # фиксируем couple/pet в момент открытия формы, чтобы переключение между питомцами
+    # не отправило письмо уже другому человеку.
     couple = await get_couple_by_id(couple_id) if couple_id else await get_active_couple(sender_id)
     if not couple or sender_id not in (couple['user1_id'], couple['user2_id']):
         return False, 'Сначала выбери Mochi 🐱'
@@ -780,11 +881,28 @@ async def send_mochi_mail(
         f'🐾 <i>Передано через {pet_name}</i>'
     )
 
+    # delay=None: письмо не исчезает через 4 секунды. Оно живёт до следующего
+    # действия получателя, а Clean Chat удалит его при следующем взаимодействии.
     sent = await send_temp_animation(partner_id, pet['id'], 'love', caption, delay=None)
     if not sent:
         return False, 'Не получилось доставить сообщение 😿'
     MOCHI_MAIL_LAST_AT[mail_key] = asyncio.get_running_loop().time()
     return True, partner_id
+
+
+def random_event_effects_text(effects: dict) -> str:
+    bits = []
+    for key, emoji in (
+        ('coins', '🪙'),
+        ('hunger', '🍓'),
+        ('happiness', '✨'),
+        ('energy', '⚡'),
+        ('love', '❤️'),
+    ):
+        value = int(effects.get(key, 0) or 0)
+        if value:
+            bits.append(f'{emoji} {value:+d}')
+    return ' · '.join(bits) if bits else 'без изменения статов'
 
 
 def cooldown_left(pet_id):
@@ -795,11 +913,17 @@ def cooldown_left(pet_id):
 async def game_rewards(pet_id, action_key, base_xp, base_coins):
     before = await get_pet_by_id(pet_id)
     pet, _ = await add_progress(pet_id, xp=base_xp, coins=base_coins)
-    daily_done = await record_action(pet_id, action_key)
+    daily_done, joint_streak = await record_action(pet_id, action_key)
+    daily_bonus = await claim_daily_completion_bonus(pet_id)
     unlocked = await check_achievements(pet_id)
     after = await get_pet_by_id(pet_id)
     messages = []
     stage_changed = False
+    if joint_streak and joint_streak.get('new_day'):
+        messages.append(
+            f'🤝 Стрик совместных действий: <b>{joint_streak["streak"]} дн.</b> '
+            f'· рекорд <b>{joint_streak["best_streak"]}</b>'
+        )
     if before and after and after['level'] > before['level']:
         messages.append(f'⭐ Новый уровень: <b>{after["level"]}</b>!')
         before_stage = current_growth_stage(before['level'])
@@ -811,6 +935,11 @@ async def game_rewards(pet_id, action_key, base_xp, base_coins):
             )
     for task in daily_done:
         messages.append(f'📅 Ежедневка выполнена: <b>{task["title"]}</b> (+{task["reward_coins"]}🪙, +{task["reward_xp"]}XP)')
+    if daily_bonus:
+        messages.append(
+            f'🎁 <b>Все ежедневки закрыты!</b> '
+            f'(+{daily_bonus["coins"]}🪙, +{daily_bonus["xp"]}XP)'
+        )
     for key in unlocked:
         title, _, coins, xp = ACHIEVEMENTS[key]
         messages.append(f'🏆 Достижение: <b>{title}</b> (+{coins}🪙, +{xp}XP)')
@@ -818,7 +947,8 @@ async def game_rewards(pet_id, action_key, base_xp, base_coins):
 
 
 async def perform_action(callback, *, action_key, state, action_text, base_xp, base_coins,
-                         hunger_delta=0, happiness_delta=0, energy_delta=0, love_delta=0):
+                         hunger_delta=0, happiness_delta=0, energy_delta=0, love_delta=0,
+                         cost=0, min_energy=0, bind_from_callback=True, reaction_variant=None):
     await touch_user(callback.from_user.id)
     couple = await get_active_couple(callback.from_user.id)
     pet = await get_pet_by_user(callback.from_user.id)
@@ -828,19 +958,36 @@ async def perform_action(callback, *, action_key, state, action_text, base_xp, b
     if not couple['user2_id']:
         await safe_callback_answer(callback, 'Сначала пригласи второго хозяина 💞', show_alert=True)
         return
-
-    await bind_screen_to_callback(callback)
+    # Только кнопки на главном экране могут перепривязывать canonical screen.
+    # Варианты ухода открываются во временном сообщении и не должны подменять его.
+    if bind_from_callback:
+        await bind_screen_to_callback(callback)
     action_lock = PET_ACTION_LOCKS.setdefault(pet['id'], asyncio.Lock())
     async with action_lock:
         cd = cooldown_left(pet['id'])
         if cd > 0:
             await safe_callback_answer(callback, f'Секундочку 😼 {cd:.1f}с')
             return
-        await safe_callback_answer(callback)
-        PET_ACTION_LAST_AT[pet['id']] = asyncio.get_running_loop().time()
+        pet = await get_pet_by_id(pet['id'])
+        if min_energy and pet and int(pet['energy']) < int(min_energy):
+            await safe_callback_answer(callback, f'Нужно хотя бы {int(min_energy)} ⚡ энергии 😴', show_alert=True)
+            return
 
-        pet = await update_pet(pet['id'], hunger_delta, happiness_delta, energy_delta, love_delta)
-        text = action_text.replace('Mochi', pet['name'])
+        pet, failure = await apply_care_action(
+            pet['id'], cost=cost, hunger_delta=hunger_delta, happiness_delta=happiness_delta,
+            energy_delta=energy_delta, love_delta=love_delta,
+        )
+        if failure == 'insufficient_coins':
+            await safe_callback_answer(callback, f'Не хватает монет 🪙 Нужно {int(cost)}.', show_alert=True)
+            return
+        if not pet:
+            await safe_callback_answer(callback, 'Питомец не найден', show_alert=True)
+            return
+
+        PET_ACTION_LAST_AT[pet['id']] = asyncio.get_running_loop().time()
+        await safe_callback_answer(callback)
+        reaction = choose_action_reaction(action_key, reaction_variant, pet, action_text)
+        text = reaction.replace('Mochi', str(pet['name']))
         _, reward_messages, _stage_changed = await game_rewards(pet['id'], action_key, base_xp, base_coins)
 
     couple_id = await get_couple_id_by_pet(pet['id'])
@@ -849,6 +996,8 @@ async def perform_action(callback, *, action_key, state, action_text, base_xp, b
     for uid in targets:
         await show_action_on_screen(uid, pet['id'], state, text)
 
+    # Если второй хозяин сейчас смотрит другого Mochi, его экран не переключаем, но событие
+    # не теряем: отправляем лёгкое уведомление про нужного питомца.
     partner_id = await get_partner_id(callback.from_user.id, couple_id)
     if partner_id and partner_id not in targets:
         await notify_action_to_couple(callback.from_user.id, couple_id, pet['id'], state, text)
@@ -903,6 +1052,137 @@ async def screen_handler(message: Message):
     await recreate_own_screen(message.from_user.id, message.chat.id)
 
 
+def _profile_age_text(days: int) -> str:
+    days = max(0, int(days or 0))
+    if days == 0:
+        return 'меньше дня'
+    if days % 10 == 1 and days % 100 != 11:
+        suffix = 'день'
+    elif days % 10 in {2, 3, 4} and days % 100 not in {12, 13, 14}:
+        suffix = 'дня'
+    else:
+        suffix = 'дней'
+    return f'{days} {suffix}'
+
+
+def _profile_text(snapshot, partner_name: str) -> str:
+    pet = snapshot['pet']
+    metrics = snapshot['metrics']
+    stage = current_growth_stage(pet['level'])
+    need_xp = 100 * int(pet['level'])
+    rar = snapshot['rarity_counts']
+    rar_total = snapshot['rarity_totals']
+    created = str(pet.get('created_at') or '')[:10] or '—'
+    partner = escape(str(partner_name or '—'))
+    name = escape(str(pet.get('name') or 'Mochi'))
+    condition = mochi_condition(pet)
+    lines = [
+        f'👤 <b>Профиль {name}</b>',
+        '',
+        f'💭 Состояние: <b>{condition["emoji"]} {condition["title"]}</b>',
+        f'🐱 Этап: <b>{stage["title"]}</b> · ⭐ уровень <b>{pet["level"]}</b>',
+        f'✨ XP: <b>{pet["xp"]}/{need_xp}</b> · 🪙 <b>{pet["coins"]}</b>',
+        f'🎂 Возраст: <b>{_profile_age_text(snapshot["age_days"])}</b> · с <b>{created}</b>',
+        f'💞 Второй хозяин: <b>{partner}</b>',
+        '',
+        '🤝 <b>Стрик совместных действий</b>',
+        f'Сейчас: <b>{snapshot["joint_streak"]}</b> дн. · рекорд: <b>{snapshot["joint_streak_best"]}</b> дн.',
+        f'Дней с подтверждённым совместным действием: <b>{snapshot["joint_streak_days_total"]}</b>',
+        '',
+        '📊 <b>Уход и активность</b>',
+        f'Всего действий: <b>{metrics.get("actions_total", 0)}</b>',
+        f'🍓 Кормлений: <b>{metrics.get("feed_total", 0)}</b> · 🧶 игр: <b>{metrics.get("play_total", 0)}</b>',
+        f'❤️ Ласки: <b>{metrics.get("love_total", 0)}</b> · 🌙 сна: <b>{metrics.get("sleep_total", 0)}</b>',
+        f'🤝 Совместных действий: <b>{metrics.get("joint_total", 0)}</b>',
+        f'🎮 Мини-игр: <b>{metrics.get("minigames_total", 0)}</b> · 🎲 событий: <b>{metrics.get("random_events_total", 0)}</b>',
+        f'📅 Ежедневок: <b>{metrics.get("dailies_completed", 0)}</b> · полных дней: <b>{metrics.get("daily_full_clears", 0)}</b>',
+        '',
+        '🏠 <b>Коллекция</b>',
+        f'🎒 Собрано: <b>{snapshot["inventory_total"]}/{snapshot["catalog_total"]}</b> · в комнате: <b>{snapshot["equipped_count"]}</b>',
+        f'⚪ {rar["common"]}/{rar_total["common"]} · 🟢 {rar["uncommon"]}/{rar_total["uncommon"]}',
+        f'🔵 {rar["rare"]}/{rar_total["rare"]} · 🟣 {rar["epic"]}/{rar_total["epic"]} · 🟡 {rar["legendary"]}/{rar_total["legendary"]}',
+        f'🎁 Только из событий: <b>{snapshot["drop_only_owned"]}/{snapshot["drop_only_total"]}</b>',
+        '',
+        f'🏆 Достижения: <b>{snapshot["achievements_count"]}/{snapshot["achievements_total"]}</b>',
+    ]
+    return '\n'.join(lines)
+
+
+async def show_profile(target, user_id: int):
+    pet = await get_pet_by_user(user_id)
+    if not pet:
+        await answer_ephemeral(target, 'Сначала создай Mochi через /start 🐱')
+        return
+    snapshot = await get_pet_profile(pet['id'])
+    couple = await get_active_couple(user_id)
+    partner = await partner_label(user_id, couple) if couple else '—'
+    if not snapshot:
+        await answer_ephemeral(target, 'Не получилось загрузить профиль 😿')
+        return
+    await answer_ephemeral(target, _profile_text(snapshot, partner), parse_mode='HTML', reply_markup=profile_keyboard())
+
+
+@dp.message(Command('profile'))
+async def profile_command_handler(message: Message):
+    await save_user(message.from_user)
+    await show_profile(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == 'profile')
+async def profile_callback_handler(c):
+    await safe_callback_answer(c)
+    await show_profile(c.message, c.from_user.id)
+
+
+
+def _history_date(value: str) -> str:
+    raw = str(value or '')
+    return raw[:10] if len(raw) >= 10 else '—'
+
+
+async def show_history(target, user_id: int, page: int = 0):
+    pet = await get_pet_by_user(user_id)
+    if not pet:
+        await answer_ephemeral(target, 'Сначала создай Mochi через /start 🐱')
+        return
+    page_size = 8
+    rows, total = await get_pet_history(pet['id'], limit=page_size, offset=max(0, page) * page_size)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    if total and not rows:
+        rows, total = await get_pet_history(pet['id'], limit=page_size, offset=page * page_size)
+    name = escape(str(pet['name'] or 'Mochi'))
+    lines = [f'📜 <b>История {name}</b>', '']
+    if not rows:
+        lines.append('История пока только начинается 🐾')
+    else:
+        for row in rows:
+            details = escape(str(row.get('details') or ''))
+            title = escape(str(row.get('title') or 'Событие'))
+            line = f'<b>{_history_date(row.get("created_at"))}</b> · {title}'
+            if details:
+                line += f' — {details}'
+            lines.append(line)
+    lines.extend(['', f'<i>Записей: {total}</i>'])
+    await answer_ephemeral(target, '\n'.join(lines), parse_mode='HTML', reply_markup=history_keyboard(page, total_pages))
+
+
+@dp.message(Command('history'))
+async def history_command_handler(message: Message):
+    await save_user(message.from_user)
+    await show_history(message, message.from_user.id, 0)
+
+
+@dp.callback_query(F.data.startswith('history:'))
+async def history_callback_handler(c):
+    await safe_callback_answer(c)
+    try:
+        page = max(0, int(c.data.split(':', 1)[1]))
+    except (ValueError, IndexError):
+        page = 0
+    await show_history(c.message, c.from_user.id, page)
+
+
 async def activate_promo_for_user(message: Message, state: FSMContext, raw_code: str):
     code = ' '.join((raw_code or '').strip().split())
     ok, result = await redeem_promo_code(message.from_user.id, code)
@@ -921,7 +1201,9 @@ async def activate_promo_for_user(message: Message, state: FSMContext, raw_code:
 
     await state.clear()
     pet_id = int(result['pet_id'])
-
+    # Начисление уже зафиксировано одной транзакцией. Любая вторичная ошибка
+    # (достижения/Telegram refresh) не должна превращать успешный промокод в
+    # визуально «неудачный» — иначе пользователь попробует код снова и увидит already_used.
     unlocked = []
     try:
         unlocked = await check_achievements(pet_id)
@@ -952,7 +1234,8 @@ async def activate_promo_for_user(message: Message, state: FSMContext, raw_code:
 
 @dp.message(Command('promo'))
 async def promo_handler(message: Message, state: FSMContext):
-
+    # Явная команда промокода должна отменять незавершённую форму rename/mail/broadcast,
+    # иначе неудачный код мог оставить пользователя в старом FSM-state.
     await state.clear()
     await save_user(message.from_user)
     parts = (message.text or '').split(maxsplit=1)
@@ -1117,7 +1400,7 @@ async def prepare_broadcast(message: Message, state: FSMContext, raw_text: str):
         f'Длина: {len(text)}/{BROADCAST_MAX_LENGTH}\n\n'
         f'{preview_text}'
     )
-
+    # Не удаляем preview middleware'ом при клике по кнопке подтверждения.
     sent = await bot.send_message(
         message.chat.id,
         preview,
@@ -1266,26 +1549,204 @@ async def broadcast_confirm_handler(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == 'feed')
 async def feed_handler(c):
-    await perform_action(c, action_key='feed', state='eat', action_text='🍓 Mochi вкусно поел и довольно урчит.', base_xp=6, base_coins=2, hunger_delta=15, happiness_delta=2)
+    await bind_screen_to_callback(c)
+    await safe_callback_answer(c)
+    await answer_ephemeral(
+        c.message,
+        '🍓 <b>Чем покормить Mochi?</b>\n\nВыбери вариант. Платные корма списывают монеты только если действие успешно выполнено.',
+        parse_mode='HTML',
+        reply_markup=feed_options_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == 'play')
 async def play_handler(c):
-    pet = await get_pet_by_user(c.from_user.id)
-    if pet and pet['energy'] < 10:
-        await safe_callback_answer(c, 'Питомец слишком устал 😴', show_alert=True)
-        return
-    await perform_action(c, action_key='play', state='play', action_text='🧶 Mochi носится за клубком по всей комнате.', base_xp=8, base_coins=3, happiness_delta=15, energy_delta=-10, hunger_delta=-3)
+    await bind_screen_to_callback(c)
+    await safe_callback_answer(c)
+    await answer_ephemeral(
+        c.message,
+        '🧶 <b>Как поиграть с Mochi?</b>\n\nЧем активнее игра, тем больше настроение — и тем больше расход энергии.',
+        parse_mode='HTML',
+        reply_markup=play_options_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == 'love')
 async def love_handler(c):
-    await perform_action(c, action_key='love', state='love', action_text='❤️ Mochi замурчал и прижался поближе.', base_xp=6, base_coins=2, happiness_delta=5, love_delta=10)
+    await bind_screen_to_callback(c)
+    await safe_callback_answer(c)
+    await answer_ephemeral(
+        c.message,
+        '❤️ <b>Как почухать Mochi?</b>\n\nВсе варианты бесплатные и дают одинаковый эффект — выбирай по настроению 😼',
+        parse_mode='HTML',
+        reply_markup=love_options_keyboard(),
+    )
+
+
+CARE_VARIANTS = {
+    ('feed', 'basic'): dict(state='eat', text='🥣 Mochi похрустел обычным кормом.', xp=3, cost=0, hunger=3),
+    ('feed', 'premium'): dict(state='eat', text='🍗 Mochi с удовольствием съел премиальный корм.', xp=4, cost=10, hunger=6),
+    ('feed', 'hearty'): dict(state='eat', text='🍱 Mochi плотно поел сытным рационом.', xp=6, cost=22, hunger=11),
+    ('feed', 'delicacy'): dict(state='eat', text='🍣 Mochi устроил настоящий праздник с деликатесом!', xp=9, cost=40, hunger=18),
+
+    ('play', 'yarn'): dict(state='play', text='🧶 Mochi погонял клубок по комнате.', xp=4, cost=0, happiness=4, energy=-2, hunger=-1, min_energy=2),
+    ('play', 'laser'): dict(state='play', text='🔴 Mochi азартно гонялся за красной точкой.', xp=5, cost=8, happiness=7, energy=-4, hunger=-1, min_energy=4),
+    ('play', 'feather'): dict(state='play', text='🪶 Mochi устроил охоту на дразнилку с перьями.', xp=7, cost=16, happiness=11, energy=-6, hunger=-2, love=1, min_energy=6),
+    ('play', 'course'): dict(state='play', text='🏰 Mochi прошёл целую полосу препятствий и очень собой доволен!', xp=10, cost=28, happiness=16, energy=-9, hunger=-3, love=2, min_energy=9),
+
+    ('love', 'belly'): dict(state='love', text='🤲 Mochi дал почухать животик и довольно растянулся.', xp=5, cost=0, happiness=4, love=8),
+    ('love', 'ear'): dict(state='love', text='👂 Mochi блаженно замурчал, пока его чухали за ушком.', xp=5, cost=0, happiness=4, love=8),
+    ('love', 'butt'): dict(state='love', text='🐾 Mochi очень серьёзно одобрил почухивание попы.', xp=5, cost=0, happiness=4, love=8),
+}
+
+# Реакции не меняют экономику или статы: это только вариативный характер ответа.
+ACTION_REACTIONS = {
+    ('feed', 'basic'): (
+        '🥣 Mochi аккуратно похрустел обычным кормом.',
+        '🥣 Mochi сначала внимательно понюхал корм, а потом всё доел.',
+        '🥣 Mochi расправился с кормом и довольно облизнулся.',
+        '🥣 Mochi ел не спеша, будто оценивал каждый кусочек.',
+    ),
+    ('feed', 'premium'): (
+        '🍗 Mochi с удовольствием съел премиальный корм.',
+        '🍗 Mochi мгновенно понял, что сегодня корм особенный.',
+        '🍗 Mochi довольно заурчал и не оставил в миске ни крошки.',
+        '🍗 Mochi посмотрел на хозяина так, будто просит запомнить этот выбор.',
+    ),
+    ('feed', 'hearty'): (
+        '🍱 Mochi плотно поел сытным рационом и довольно улёгся.',
+        '🍱 Mochi серьёзно подошёл к рациону и справился со всей порцией.',
+        '🍱 После сытного рациона Mochi выглядит очень довольным собой.',
+        '🍱 Mochi доел рацион и ещё пару секунд проверял пустую миску.',
+    ),
+    ('feed', 'delicacy'): (
+        '🍣 Mochi устроил настоящий праздник с деликатесом!',
+        '🍣 Mochi замер на секунду, попробовал деликатес — и тут же потребовал продолжения.',
+        '🍣 Деликатес явно попал в настроение: Mochi довольно щурится.',
+        '🍣 Mochi ел так торжественно, будто это главный ужин недели.',
+    ),
+    ('play', 'yarn'): (
+        '🧶 Mochi погонял клубок по комнате.',
+        '🧶 Mochi устроил короткую охоту на клубок и победил.',
+        '🧶 Клубок укатился подальше, но Mochi оказался быстрее.',
+        '🧶 Mochi пару раз промахнулся по клубку, а потом сделал вид, что так и было задумано.',
+    ),
+    ('play', 'laser'): (
+        '🔴 Mochi азартно гонялся за красной точкой.',
+        '🔴 Красная точка снова ускользнула — Mochi требует реванш.',
+        '🔴 Mochi носился за лазером по комнате, не замечая ничего вокруг.',
+        '🔴 Mochi почти поймал точку и теперь подозрительно смотрит на стену.',
+    ),
+    ('play', 'feather'): (
+        '🪶 Mochi устроил охоту на дразнилку с перьями.',
+        '🪶 Mochi подкрался к перьям и совершил идеальный прыжок.',
+        '🪶 Перья были пойманы, отпущены и тут же пойманы снова.',
+        '🪶 Mochi так увлёкся охотой, что на секунду забыл обо всём остальном.',
+    ),
+    ('play', 'course'): (
+        '🏰 Mochi прошёл целую полосу препятствий и очень собой доволен!',
+        '🏰 Mochi промчался по полосе препятствий почти без остановок.',
+        '🏰 После финиша Mochi гордо осмотрел комнату — результат принят.',
+        '🏰 Mochi закончил трассу эффектным прыжком и явно ждёт аплодисментов.',
+    ),
+    ('love', 'belly'): (
+        '🤲 Mochi дал почухать животик и довольно растянулся.',
+        '🤲 Mochi перевернулся на спину и явно решил никуда больше не уходить.',
+        '🤲 От почухивания животика Mochi довольно заурчал.',
+        '🤲 Mochi вытянул лапки и полностью доверился процессу.',
+    ),
+    ('love', 'ear'): (
+        '👂 Mochi блаженно замурчал, пока его чухали за ушком.',
+        '👂 Mochi наклонил голову: кажется, за ушком нашли идеальное место.',
+        '👂 Почухивание за ушком прошло проверку качества — Mochi доволен.',
+        '👂 Mochi прикрыл глаза и начал тихо урчать.',
+    ),
+    ('love', 'butt'): (
+        '🐾 Mochi очень серьёзно одобрил почухивание попы.',
+        '🐾 Mochi выгнул спинку и потребовал не останавливаться.',
+        '🐾 Кажется, этот вариант почесушек Mochi считает абсолютно правильным.',
+        '🐾 Mochi довольно переступает лапками и явно наслаждается вниманием.',
+    ),
+    ('sleep', 'default'): (
+        '🌙 Mochi свернулся клубочком и быстро уснул. Zzz...',
+        '🌙 Mochi несколько раз покрутился, нашёл идеальное место и уснул.',
+        '🌙 Mochi уютно устроился и почти сразу начал сопеть.',
+        '🌙 Ещё секунду назад Mochi смотрел вокруг, а теперь уже крепко спит.',
+    ),
+}
+
+CONDITION_REACTION_SUFFIXES = {
+    'overexcited': (
+        '🤪 Энергии у него всё ещё хоть отбавляй.',
+        '💨 Кажется, на этом он останавливаться не собирается.',
+    ),
+    'happy': (
+        '🥰 Судя по мордочке, день проходит отлично.',
+        '✨ Mochi выглядит особенно довольным.',
+    ),
+    'sleepy': (
+        '🥱 Правда, глаза у него уже немного слипаются.',
+        '💤 После этого Mochi явно не отказался бы от отдыха.',
+    ),
+    'hungry': (
+        '🥣 Но на миску он всё ещё периодически поглядывает.',
+    ),
+    'capricious': (
+        '😼 Впрочем, делает вид, что впечатлить его было совсем непросто.',
+    ),
+    'needs_love': (
+        '💕 Кажется, немного внимания ему сейчас особенно приятно.',
+    ),
+}
+
+
+def choose_action_reaction(action_key, variant_key, pet, fallback: str) -> str:
+    pool = ACTION_REACTIONS.get((action_key, variant_key))
+    text = secrets.choice(pool) if pool else str(fallback)
+    condition = mochi_condition(pet) if pet else {'key': 'calm'}
+    suffixes = CONDITION_REACTION_SUFFIXES.get(condition['key'])
+    # Иногда добавляем вторую короткую реакцию, но не каждый раз, чтобы текст не шумел.
+    if suffixes and secrets.randbelow(100) < 32:
+        text = f'{text} {secrets.choice(suffixes)}'
+    return text
+
+
+@dp.callback_query(F.data.startswith('care:'))
+async def care_variant_handler(c: CallbackQuery):
+    try:
+        _, action_key, variant_key = c.data.split(':', 2)
+    except ValueError:
+        await safe_callback_answer(c, 'Неизвестное действие', show_alert=True)
+        return
+    cfg = CARE_VARIANTS.get((action_key, variant_key))
+    if not cfg:
+        await safe_callback_answer(c, 'Этот вариант больше недоступен.', show_alert=True)
+        return
+    await perform_action(
+        c,
+        action_key=action_key,
+        state=cfg['state'],
+        action_text=cfg['text'],
+        base_xp=cfg['xp'],
+        base_coins=0,
+        hunger_delta=cfg.get('hunger', 0),
+        happiness_delta=cfg.get('happiness', 0),
+        energy_delta=cfg.get('energy', 0),
+        love_delta=cfg.get('love', 0),
+        cost=cfg.get('cost', 0),
+        min_energy=cfg.get('min_energy', 0),
+        bind_from_callback=False,
+        reaction_variant=variant_key,
+    )
 
 
 @dp.callback_query(F.data == 'sleep')
 async def sleep_handler(c):
-    await perform_action(c, action_key='sleep', state='sleep', action_text='🌙 Mochi свернулся клубочком и уснул. Zzz...', base_xp=4, base_coins=1, energy_delta=100)
+    await perform_action(
+        c, action_key='sleep', state='sleep',
+        action_text='🌙 Mochi свернулся клубочком и уснул. Zzz...',
+        base_xp=4, base_coins=1, energy_delta=100, reaction_variant='default',
+    )
 
 
 # ---- Переименование ----
@@ -1338,12 +1799,180 @@ async def dailies_handler(c):
     pet = await get_pet_by_user(c.from_user.id)
     if not pet:
         return
-    tasks = await get_daily_tasks(pet['id'])
-    lines = ['📅 <b>Ежедневные задания</b>\n']
-    for t in tasks:
+    daily = await get_daily_overview(pet['id'])
+    lines = [
+        '📅 <b>Ежедневные задания</b>',
+        f'🤝 Стрик вместе: <b>{daily["streak"]}</b> дн. · рекорд <b>{daily["best_streak"]}</b>',
+        f'Прогресс дня: <b>{daily["completed"]}/{daily["total"]}</b>\n',
+    ]
+    for t in daily['tasks']:
         mark = '✅' if t['completed'] else '▫️'
         lines.append(f'{mark} {t["title"]} — <b>{t["progress"]}/{t["target"]}</b>\n   +{t["reward_coins"]}🪙 · +{t["reward_xp"]}XP')
+    if daily['bonus_claimed']:
+        lines.append('\n🎁 <b>Бонус за все задания уже получен ✅</b>')
+    else:
+        lines.append(
+            f'\n🎁 За выполнение всех заданий: '
+            f'<b>+{daily["bonus_coins"]}🪙 · +{daily["bonus_xp"]}XP</b>'
+        )
+    lines.append('\n<i>Квесты общие для двух хозяев. Стрик подтверждается только завершённым совместным действием.</i>')
     await answer_ephemeral(c.message, '\n'.join(lines), parse_mode='HTML', reply_markup=back_keyboard())
+
+# ---- Мини-игры ----
+def _cooldown_text(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    minutes = max(1, (seconds + 59) // 60)
+    return f'{minutes} мин.'
+
+
+def _rps_label(value: str) -> str:
+    return {'rock': '✊ камень', 'paper': '✋ бумага', 'scissors': '✌️ ножницы'}.get(value, value)
+
+
+@dp.callback_query(F.data == 'minigames')
+async def minigames_handler(c):
+    await safe_callback_answer(c)
+    pet = await get_pet_by_user(c.from_user.id)
+    if not pet:
+        return
+    cooldown = await get_minigame_cooldown(c.from_user.id, pet['id'])
+    status = (
+        f'⏳ Следующая наградная игра через <b>{_cooldown_text(cooldown)}</b>.'
+        if cooldown > 0 else
+        '✅ Сейчас можно сыграть и получить награду.'
+    )
+    text = (
+        '🎮 <b>Мини-игры</b>\n\n'
+        f'{status}\n\n'
+        '📦 <b>Три коробки</b> — угадай, где спрятаны монетки.\n'
+        '✊ <b>Камень · бумага · ножницы</b> — сыграй против Mochi.\n'
+        '🔢 <b>Больше или меньше</b> — угадай следующее число.\n\n'
+        '<i>Одна наградная игра доступна раз в 20 минут. Проигрыш тоже даёт маленький утешительный приз.</i>'
+    )
+    await answer_ephemeral(c.message, text, parse_mode='HTML', reply_markup=minigames_keyboard())
+
+
+@dp.callback_query(F.data.startswith('mg_start:'))
+async def minigame_start_handler(c):
+    await safe_callback_answer(c)
+    game_key = c.data.split(':', 1)[1]
+    pet = await get_pet_by_user(c.from_user.id)
+    if not pet:
+        return
+    # Ежедневки создаём до write-транзакции завершения игры.
+    await get_daily_overview(pet['id'])
+    ok, session = await create_minigame_session(c.from_user.id, pet['id'], game_key)
+    if not ok:
+        if session.get('reason') == 'cooldown':
+            await answer_ephemeral(
+                c.message,
+                f'⏳ Mochi немного устал от игр. Попробуй снова через <b>{_cooldown_text(session.get("seconds", 0))}</b>.',
+                parse_mode='HTML',
+                reply_markup=back_keyboard('minigames'),
+            )
+        else:
+            await answer_ephemeral(c.message, 'Не удалось начать мини-игру 😿', reply_markup=back_keyboard('minigames'))
+        return
+
+    token = session['token']
+    payload = session['payload']
+    if game_key == 'boxes':
+        text = '📦 <b>Три коробки</b>\n\nВ одной коробке Mochi спрятал монетки. Выбирай!'
+        kb = boxes_game_keyboard(token)
+    elif game_key == 'rps':
+        text = '✊ <b>Камень · бумага · ножницы</b>\n\nMochi уже сделал свой выбор. Твой ход:'
+        kb = rps_game_keyboard(token)
+    elif game_key == 'higher':
+        text = (
+            '🔢 <b>Больше или меньше</b>\n\n'
+            f'Текущее число: <b>{payload["current"]}</b>\n'
+            'Следующее число от 1 до 9 будет больше или меньше?'
+        )
+        kb = higher_game_keyboard(token)
+    else:
+        return
+    await answer_ephemeral(c.message, text, parse_mode='HTML', reply_markup=kb, delay=300, cleanup_on_next=False)
+
+
+@dp.callback_query(F.data.startswith('mg:'))
+async def minigame_resolve_handler(c):
+    await safe_callback_answer(c)
+    parts = c.data.split(':', 3)
+    if len(parts) != 4:
+        return
+    _, game_key, token, answer = parts
+    pet = await get_pet_by_user(c.from_user.id)
+    if not pet:
+        return
+    before_stage = current_growth_stage(pet['level'])
+    await get_daily_overview(pet['id'])
+    ok, result = await resolve_minigame_session(c.from_user.id, token, answer)
+    if not ok:
+        reason = result.get('reason')
+        if reason == 'cooldown':
+            text = f'⏳ Награда уже получена. Следующая игра через {_cooldown_text(result.get("seconds", 0))}.'
+        elif reason == 'already_done':
+            text = '✅ Эта мини-игра уже завершена.'
+        elif reason == 'expired':
+            text = '⌛ Эта партия уже истекла. Открой меню мини-игр и начни новую.'
+        else:
+            text = 'Эта игровая сессия уже недоступна 😿'
+        await answer_ephemeral(c.message, text, reply_markup=back_keyboard('minigames'))
+        return
+
+    # Убираем игровое сообщение с активными кнопками после завершения партии,
+    # чтобы старый callback не висел в чате пять минут.
+    try:
+        if await try_delete_message(c.message.chat.id, c.message.message_id):
+            await forget_ephemeral(c.from_user.id, c.message.chat.id, c.message.message_id)
+    except Exception:
+        pass
+
+    game_key = result['game_key']
+    details = result['details']
+    if game_key == 'boxes':
+        if result['result'] == 'win':
+            headline = '🎉 Ты угадал!'
+        else:
+            headline = f'😼 Почти! Монетки были в коробке <b>{details["target"]}</b>.'
+    elif game_key == 'rps':
+        headline = {
+            'win': '🏆 Ты победил Mochi!', 'draw': '🤝 Ничья!', 'loss': '😼 В этот раз Mochi победил!'
+        }[result['result']]
+        headline += f'\nТы: <b>{_rps_label(details["player"])}</b> · Mochi: <b>{_rps_label(details["bot"])}</b>'
+    else:
+        headline = {
+            'win': '🎯 Верно!', 'draw': '🤝 Выпало то же число — ничья.', 'loss': '🙈 Не угадал в этот раз.'
+        }[result['result']]
+        headline += f'\nБыло <b>{details["current"]}</b> → выпало <b>{details["next"]}</b>.'
+
+    lines = [
+        headline,
+        f'Награда: <b>+{result["coins"]} 🪙 · +{result["xp"]} XP</b>',
+        f'✨ Настроение +{result["happiness"]} · ⚡ Энергия {result["energy"]}',
+    ]
+    for task in result.get('completed_tasks', []):
+        lines.append(f'📅 Ежедневка выполнена: <b>{task["title"]}</b> (+{task["reward_coins"]}🪙, +{task["reward_xp"]}XP)')
+    bonus = await claim_daily_completion_bonus(result['pet_id'])
+    if bonus:
+        lines.append(f'🎁 Все ежедневки закрыты! +{bonus["coins"]}🪙 · +{bonus["xp"]}XP')
+    unlocked = await check_achievements(result['pet_id'])
+    for key in unlocked:
+        title, _, coins, xp = ACHIEVEMENTS[key]
+        lines.append(f'🏆 {title} (+{coins}🪙, +{xp}XP)')
+
+    updated = await get_pet_by_id(result['pet_id'])
+    await refresh_pet_screens(result['pet_id'])
+    if updated and before_stage['key'] != current_growth_stage(updated['level'])['key']:
+        await refresh_room_media_for_pet(result['pet_id'])
+    await answer_ephemeral(
+        c.message,
+        '\n'.join(lines),
+        parse_mode='HTML',
+        reply_markup=back_keyboard('minigames'),
+        delay=30,
+        cleanup_on_next=False,
+    )
 
 
 # ---- Магазин ----
@@ -1355,8 +1984,16 @@ async def shop_handler(c):
         return
     inv = await get_inventory(pet['id'])
     owned = {r['item_key'] for r in inv}
-    await answer_ephemeral(c.message, f'🛍 <b>Магазин комнаты</b>\nБаланс: <b>{pet["coins"]} 🪙</b>\n\nПокупки общие для двух хозяев.', parse_mode='HTML', reply_markup=shop_keyboard(SHOP_ITEMS, owned))
-
+    rotation = await get_shop_rotation(pet['id'])
+    text = (
+        f'🛍 <b>Магазин комнаты</b>\nБаланс: <b>{pet["coins"]} 🪙</b>\n\n'
+        'Ассортимент меняется каждый день для этого Mochi.\n'
+        '⚪ 8 обычных · 🟢 4 необычных · 🔵 3 редких\n'
+        '🟣 эпический появляется иногда · 🟡 легендарный — редко\n\n'
+        '🎁 Некоторые предметы можно получить только из случайных событий.\n'
+        'Покупки и ассортимент общие для двух хозяев.'
+    )
+    await answer_ephemeral(c.message, text, parse_mode='HTML', reply_markup=shop_keyboard(rotation, owned))
 
 @dp.callback_query(F.data.startswith('buy:'))
 async def buy_handler(c):
@@ -1373,6 +2010,8 @@ async def buy_handler(c):
             await answer_ephemeral(c.message, '✅ Этот предмет у вас уже куплен.')
         elif reason == 'not_enough_coins':
             await answer_ephemeral(c.message, '🥲 Монет не хватает.')
+        elif reason == 'not_in_rotation':
+            await answer_ephemeral(c.message, '🕒 Этого предмета сегодня нет в магазине. Ассортимент уже мог обновиться.')
         else:
             await answer_ephemeral(c.message, 'Не удалось купить предмет 😿')
         return
@@ -1380,7 +2019,7 @@ async def buy_handler(c):
     unlocked = await check_achievements(pet['id'])
     updated = await get_pet_by_id(pet['id'])
     after_stage = current_growth_stage(updated['level']) if updated else before_stage
-    await answer_ephemeral(c.message, f'🛍 Куплено: <b>{item["emoji"]} {item["name"]}</b> за {item["price"]} 🪙\nТеперь поставь предмет через 🏠 Комната.', parse_mode='HTML')
+    await answer_ephemeral(c.message, f'🛍 Куплено: <b>{item.get("rarity_emoji", "⚪")} {item["emoji"]} {item["name"]}</b>\nРедкость: <b>{item.get("rarity_name", "Обычный")}</b> · цена {item["price"]} 🪙\nТеперь поставь предмет через 🏠 Комната.', parse_mode='HTML')
     await refresh_pet_screens(pet['id'])
     if before_stage['key'] != after_stage['key']:
         await refresh_room_media_for_pet(pet['id'])
@@ -1689,6 +2328,9 @@ async def menu_back_handler(c):
 @dp.callback_query(F.data == 'status')
 async def status_handler(c):
     await touch_user(c.from_user.id)
+    # Refresh всегда привязан к реально нажатому сообщению и сначала применяет
+    # просроченный decay. В обычном случае меняется только caption — это заметно
+    # надёжнее editMessageMedia и не создаёт новый экран.
     await bind_screen_to_callback(c)
     cancel_screen_action(c.from_user.id)
     await safe_callback_answer(c, 'Обновляю ✨')
@@ -1717,6 +2359,9 @@ async def decay_loop():
         try:
             changed = set(await apply_decay_to_all_pets())
             active = set(await get_active_pet_ids())
+            # После рестарта in-memory cache пуст. Первый проход синхронизирует все
+            # активные экраны с сохранённым screen_state; далее трогаем только питомцев,
+            # чьи видимые статы реально изменились.
             targets = active if first_pass else (changed & active)
             for pet_id in sorted(targets):
                 try:
@@ -1726,15 +2371,57 @@ async def decay_loop():
             first_pass = False
         except Exception as exc:
             print(f'Decay loop error: {exc}')
-        # Проверяем раз в минуту. Баланс остаётся -3 сытости / -1 настроения
-        # за полный час; UI синхронизируется автоматически после наступления тика.
+        # Проверяем раз в минуту. За полный час: -4 сытости, -2 настроения, -1 энергии.
+        # Любовь не деградирует сама; UI синхронизируется после наступления тика.
         await asyncio.sleep(DECAY_REFRESH_INTERVAL_SECONDS)
+
+
+async def random_event_loop():
+    # События происходят сами по себе, но не спамят парам, которые полностью
+    # забросили питомца: просроченное событие дождётся следующего возвращения.
+    while True:
+        try:
+            for pet_id in await get_due_random_event_pet_ids(limit=50):
+                couple_id = await get_couple_id_by_pet(pet_id)
+                if not couple_id or await both_inactive_for_hours_for_couple(couple_id, 24):
+                    continue
+
+                before = await get_pet_by_id(pet_id)
+                event = await trigger_random_event(pet_id)
+                if not event:
+                    continue
+                unlocked = await check_achievements(pet_id)
+                after = await get_pet_by_id(pet_id)
+
+                await refresh_pet_screens(pet_id)
+                if before and after and current_growth_stage(before['level'])['key'] != current_growth_stage(after['level'])['key']:
+                    await refresh_room_media_for_pet(pet_id)
+
+                raw_pet_name = str(after['name'] if after else before['name'] if before else 'Mochi')
+                story = escape(str(event['text']).replace('Mochi', raw_pet_name))
+                lines = [
+                    '🎲 <b>Случайное событие!</b>',
+                    story,
+                    f'Изменения: <b>{random_event_effects_text(event["effects"])}</b>',
+                ]
+                if event.get('item_key'):
+                    lines.append(f'🎁 Найден предмет: <b>{escape(item_label(event["item_key"]))}</b>')
+                for key in unlocked:
+                    title, _, coins, xp = ACHIEVEMENTS[key]
+                    lines.append(f'🏆 Достижение: <b>{title}</b> (+{coins}🪙, +{xp}XP)')
+                for uid in await get_couple_user_ids_by_pet(pet_id):
+                    await send_temp_text(uid, '\n'.join(lines), delay=20, cleanup_on_next=False)
+        except Exception as exc:
+            print(f'Random event loop error: {exc}')
+        await asyncio.sleep(RANDOM_EVENT_REFRESH_INTERVAL_SECONDS)
 
 
 async def main():
     await init_db()
-
+    # Держим strong reference на фоновую задачу всё время жизни polling.
+    # Это также позволяет аккуратно остановить её при shutdown.
     decay_task = asyncio.create_task(decay_loop(), name='mochi-decay-loop')
+    event_task = asyncio.create_task(random_event_loop(), name='mochi-random-event-loop')
     if ADMIN_IDS:
         print(f'Mochi запущен 🐱 · admins: {len(ADMIN_IDS)} · /broadcast + promo management enabled')
     else:
@@ -1742,11 +2429,13 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        decay_task.cancel()
-        try:
-            await decay_task
-        except asyncio.CancelledError:
-            pass
+        for task in (decay_task, event_task):
+            task.cancel()
+        for task in (decay_task, event_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 if __name__ == '__main__':

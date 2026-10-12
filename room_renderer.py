@@ -25,14 +25,15 @@ with Image.open(BASE_PATH) as _base:
 
 SAFE_MARGIN = 8
 FRAME_COUNT = 4
-
+# Timing follows the supplied 6-frame pixel-art pack. MP4 uses a constant frame
+# duration, so eat uses the rounded mean of its source GIF frame timings.
 DURATIONS = {
     "idle": 170, "happy": 110, "sad": 190, "sleep": 260, "hungry": 160,
     "play": 100, "sick": 230, "eat": 125, "love": 110,
 }
 RENDER_VERSION = "layout-v43-new-pet-assets"
 
-# Каждый тип предмета живёт в своей зоне комнаты.
+# Каждый тип предмета живёт в своей зоне комнаты. Координаты подобраны под base.png 512x512.
 SLOT_LAYOUT = {
     "window": {"anchor": (257, 172), "max_size": (245, 250), "align": "center"},
     "decor": {"anchor": (83, 133), "max_size": (105, 115), "align": "center"},
@@ -410,7 +411,12 @@ def render_room_gif(
         return path, key
 
     pet_frames = _pet_frames(state, stage_key)
+    # Preserve every frame supplied by the source GIF. The old fixed sequence only
+    # showed frames 0..3 and silently dropped frames 4..5 from the new animations.
     rgba_frames = [_compose_frame(equipment, frame, state) for frame in pet_frames]
+
+    # Пишем во временный файл и только затем атомарно подменяем итоговый. Два параллельных
+    # рендера одного кадра больше не могут оставить в cache/rooms обрезанный MP4.
     tmp = path.with_name(f".{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp.mp4")
     try:
         _save_animation_mp4(rgba_frames, DURATIONS[state], tmp)

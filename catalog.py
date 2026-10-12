@@ -66,3 +66,67 @@ SLOT_NAMES = {'window': '🪟 Окно',
  'toy': '🧸 Игрушка'}
 
 ITEM_SLOTS = {key: item["slot"] for key, item in SHOP_ITEMS.items()}
+
+
+RARITY_INFO = {
+    'common': {'name': 'Обычный', 'emoji': '⚪', 'rank': 0},
+    'uncommon': {'name': 'Необычный', 'emoji': '🟢', 'rank': 1},
+    'rare': {'name': 'Редкий', 'emoji': '🔵', 'rank': 2},
+    'epic': {'name': 'Эпический', 'emoji': '🟣', 'rank': 3},
+    'legendary': {'name': 'Легендарный', 'emoji': '🟡', 'rank': 4},
+}
+
+# Редкость — постоянное свойство конкретного предмета. Уже купленные предметы
+# не меняются и не требуют миграции БД: inventory хранит только item_key.
+ITEM_RARITY = {
+    # beds
+    'bed_pink': 'common', 'bed_mint': 'common', 'bed_cloud': 'uncommon',
+    'bed_bear': 'uncommon', 'bed_strawberry': 'rare', 'bed_flower': 'rare',
+    'bed_bunny': 'epic', 'bed_canopy': 'legendary',
+    # rugs
+    'rug_round': 'common', 'rug_paw': 'common', 'rug_check': 'uncommon',
+    'rug_cloud': 'uncommon', 'rug_heart': 'rare', 'rug_flower': 'rare',
+    'rug_star': 'epic',
+    # lamps
+    'lamp_soft_pink': 'common', 'lamp_heart_beige': 'common',
+    'lamp_bow_pink': 'uncommon', 'lamp_bow_cream': 'uncommon',
+    'lamp_bow_tall': 'rare', 'lamp_hearts': 'rare', 'lamp_flowers': 'epic',
+    # toys
+    'toy_yarn': 'common', 'toy_mouse': 'common', 'toy_fish': 'uncommon',
+    'toy_star': 'uncommon', 'toy_bunny': 'rare', 'toy_wand': 'epic',
+    # bowls
+    'bowl_water': 'common', 'bowl_blue': 'common', 'bowl_round_food': 'uncommon',
+    'bowl_beige_food': 'uncommon', 'bowl_paw_food': 'rare',
+    # plants
+    'plant_cactus': 'common', 'plant_aloe': 'common', 'plant_sansevieria': 'uncommon',
+    'plant_ficus': 'uncommon', 'plant_monstera': 'rare', 'plant_calathea': 'rare',
+    'plant_blossom': 'epic', 'plant_bonsai': 'legendary',
+    # decor
+    'decor_moon_frame': 'common', 'decor_kitty_frame': 'uncommon',
+    'decor_star_garland': 'uncommon', 'decor_photo_garland': 'rare',
+    'decor_macrame_plant': 'rare', 'decor_cat_clock': 'epic',
+    # windows
+    'window_day': 'common', 'window_spring': 'common', 'window_autumn': 'uncommon',
+    'window_rain': 'uncommon', 'window_sunset': 'rare', 'window_winter': 'rare',
+    'window_night': 'epic', 'window_city_night': 'legendary',
+}
+
+
+
+# Предметы, которые нельзя купить в магазине: они выпадают только из редких событий.
+DROP_ONLY_ITEMS = frozenset({
+    'rug_star',
+    'toy_wand',
+    'plant_blossom',
+    'decor_cat_clock',
+    'window_city_night',
+})
+
+for _key, _item in SHOP_ITEMS.items():
+    _rarity = ITEM_RARITY.get(_key, 'common')
+    _meta = RARITY_INFO[_rarity]
+    _item['rarity'] = _rarity
+    _item['rarity_name'] = _meta['name']
+    _item['rarity_emoji'] = _meta['emoji']
+    _item['rarity_rank'] = _meta['rank']
+    _item['drop_only'] = _key in DROP_ONLY_ITEMS
